@@ -1,0 +1,85 @@
+# ==============================================================================
+# UNINA-DLA: Multi-Model Benchmark Configuration (Formula Student Driverless)
+# ==============================================================================
+# Benchmarks multiple model architectures and hardware execution backends
+# across Intelligence (mAP), Speed (Latency / FPS), and Hardware Footprint.
+#
+# Usage:
+#   python scripts/benchmark.py --config configs/benchmark_fsd.yaml
+
+# ------------------------------------------------------------------------------
+# Target Dataset & Input Resolution
+# ------------------------------------------------------------------------------
+data: configs/formula_student.yaml
+
+# Resolution: [Height, Width] matching ZED X camera native optical aspect ratio
+imgsz: [608, 960]
+
+# Batch size: 1 for edge perception latency profiling
+batch_size: 1
+
+# Device target (e.g. 0 for CUDA/GPU/DLA host, or cpu)
+device: 0
+
+# Precision options
+half: false
+
+# Profiling configuration
+warmup: 50         # Unmeasured iterations to stabilize GPU/DLA DVFS clocks
+iterations: 200    # Timed runs to generate latency percentiles (P50, P90, P95, P99)
+conf_thres: 0.25   # Inference confidence threshold
+iou_thres: 0.6     # NMS matching threshold
+max_det: 300       # Maximum detections per frame
+
+# Set to true to profile latency and memory only without evaluating dataset mAP
+speed_only: false
+
+# ------------------------------------------------------------------------------
+# Candidate Models Suite
+# ------------------------------------------------------------------------------
+models:
+  # 1. Pretrained Teacher Model (Baseline)
+  - name: "YOLO26-X Teacher"
+    path: "checkpoints/yolo26x_teacher.pt"
+    type: "yolo"
+
+  # 2. Student FP32 Distilled (PyTorch Baseline)
+  - name: "UNINA-DLA (Distilled FP32)"
+    path: "unina_dla_student/exp/best_distill.pth"
+    type: "unina_pth"
+
+  # 3. Student 2:4 Structured Sparse (PyTorch)
+  - name: "UNINA-DLA (2:4 Sparse)"
+    path: "runs/exp/best_sparse.pth"
+    type: "unina_pth"
+
+  # 4. Student INT8 QAT (PyTorch Quantized)
+  - name: "UNINA-DLA (INT8 QAT)"
+    path: "runs/exp/best_qat.pth"
+    type: "unina_pth"
+    qat: true
+
+  # 5. Exported ONNX Graph (ONNX Runtime)
+  - name: "UNINA-DLA (ONNX Graph)"
+    path: "runs/exp/unina_dla_qat.onnx"
+    type: "onnx"
+
+  # 6. TensorRT Engine targeting DLA Core 0 (Zero GPU Fallback)
+  - name: "UNINA-DLA (TensorRT DLA-0)"
+    path: "runs/exp/unina_dla_qat_dla0.engine"
+    type: "tensorrt"
+    dla_core: 0
+
+  # 7. TensorRT Engine targeting GPU
+  - name: "UNINA-DLA (TensorRT GPU)"
+    path: "runs/exp/unina_dla_qat_gpu.engine"
+    type: "tensorrt"
+
+# ------------------------------------------------------------------------------
+# Reporting & Output
+# ------------------------------------------------------------------------------
+output_dir: runs/benchmark
+save_md: true      # Markdown summary for README.md
+save_json: true    # JSON report for CI/CD
+save_csv: true     # CSV for spreadsheets and pandas
+plot: true         # Pareto frontier and latency breakdown charts

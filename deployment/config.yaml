@@ -1,0 +1,86 @@
+# UNINA-DLA Deployment Configuration
+# This file contains externalized configuration for the deployment pipeline.
+# Edit these values to tune inference behavior without recompiling.
+
+# ==============================================================================
+# Detection Thresholds
+# ==============================================================================
+
+# Minimum confidence threshold for detections (0.0 - 1.0)
+# Lower values = more detections (more false positives)
+# Higher values = fewer detections (more false negatives)
+conf_threshold: 0.25
+
+# Score threshold for class filtering (0.0 - 1.0)
+# Used during NMS if applicable
+score_threshold: 0.45
+
+# Enable class-wise NMS in postprocess.
+# false = keep current pure O2O behavior (no suppression)
+# true  = apply class-wise NMS after decode
+use_nms: false
+
+# IoU threshold used when use_nms=true
+nms_iou_threshold: 0.60
+
+# ==============================================================================
+# Model Configuration
+# ==============================================================================
+
+# Input image dimensions (must match trained model AND TensorRT engine)
+# Valid 16:10 resolutions (match ZED X aspect ratio, all DLA-compatible):
+#   512x320   - Fastest inference, shortest detection range
+#   768x480   - Balanced speed/range (default)
+#   1024x640  - Recommended for best detection range (0.53x density)
+#   1280x800  - Maximum range, slower inference
+# NOTE: Dimensions must be multiples of 32 for DLA compatibility
+input_width: 960
+input_height: 608
+
+# Number of object classes
+num_classes: 4
+
+# Class names (for visualization)
+class_names:
+  - "Yellow"
+  - "Blue"
+  - "SmallOrange"
+  - "LargeOrange"
+
+# ==============================================================================
+# Performance Tuning
+# ==============================================================================
+
+# Maximum detections per frame (prevents buffer overflow)
+max_detections: 1000
+
+# CUDA preprocessing block size (32x32 recommended for most GPUs)
+preprocess_block_size: 32
+
+# CUDA postprocess block size (16x16 recommended)
+postprocess_block_size: 16
+
+# ==============================================================================
+# ZED X CAMERA SETTINGS (2.2mm WIDE LENS OPTIMIZATION)
+# ==============================================================================
+
+# ZED X Resolution:
+# - SVGA (960x600) is the optimal base for 960x608 models.
+# - 2.2mm Lens has an ultra-wide FOV which limits pixel density at range.
+# - At 20m, a 23cm cone is only ~4 pixels using our 960x608 resolution.
+# - DO NOT use lower resolutions if reliable 20m detection is required.
+zed_resolution: "SVGA"
+
+# Target FPS (SVGA supports up to 120fps, HD1200 up to 60fps)
+# Target is 60Hz to match the control loop requirements.
+zed_fps: 60
+
+# Enable depth for 3D object detection (required for 3D cone positions)
+zed_depth_enabled: true
+
+# Depth mode (PERFORMANCE, QUALITY, ULTRA, NEURAL)
+# PERFORMANCE = fastest, good for racing
+# QUALITY = balanced
+# NEURAL = best quality, uses GPU
+zed_depth_mode: "PERFORMANCE"
+

@@ -1,0 +1,39 @@
+# FSG Cone Dataset Configuration for UNINA-DLA
+
+# Path configuration - UPDATE THE 'path' VARIABLE to your absolute dataset location
+path: data/cones_dataset
+train: train/images  # train images (relative to 'path')
+val: valid/images    # val images (relative to 'path')
+test: test/images # test images (optional) - Consistency Flip
+
+# Classes
+names:
+  0: yellow_cone
+  1: blue_cone
+  2: small_orange_cone
+  3: large_orange_cone
+
+# Number of classes
+nc: 4
+
+# DLA Requirements - Static Shapes
+# Unlike standard YOLO, we MUST enforce strict resizing to avoid DLA dynamic shape errors
+imgsz: 640  # inference size (pixels)
+
+# Student Augmentations (Stability-First Baseline)
+# Reduced from teacher-level robustness settings to improve convergence stability.
+# Note: QAT phase still disables Mosaic/Mixup in train_student.py.
+hsv_h: 0.010  # image HSV-Hue augmentation (fraction)
+hsv_s: 0.35   # moderate HSV-Saturation augmentation (fraction)
+hsv_v: 0.20   # moderate HSV-Value augmentation (fraction)
+degrees: 2.0  # light rotation (+/- deg)
+translate: 0.05  # light translation (+/- fraction)
+scale: 0.20   # light scaling (+/- gain)
+shear: 0.5    # light shear (+/- deg)
+perspective: 0.0  # disable perspective warping for stability
+flipud: 0.0  # image flip up-down (probability)
+fliplr: 0.5  # image flip left-right (probability)
+mosaic: 0.3  # reduced mosaic to avoid excessive sample distortion
+mixup: 0.0   # disable mixup for cleaner supervision
+copy_paste: 0.0  # segment copy-paste (probability)
+auto_augment: none # disable randaugment for baseline stability

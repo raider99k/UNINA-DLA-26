@@ -1,0 +1,39 @@
+# FSG Cone Dataset Configuration for UNINA-DLA (ROBUST TEACHER)
+# Use this config ONLY for Training the Teacher Model!
+
+# Path configuration - UPDATE THE 'path' VARIABLE to your absolute dataset location
+path: data/cones_dataset
+train: train/images  # train images (relative to 'path')
+val: valid/images    # val images (relative to 'path')
+test: test/images # test images (optional)
+
+# Classes
+names:
+  0: yellow_cone
+  1: blue_cone
+  2: small_orange_cone
+  3: large_orange_cone
+
+# Number of classes
+nc: 4
+
+# DLA Requirements - Static Shapes
+# Unlike standard YOLO, we MUST enforce strict resizing to avoid DLA dynamic shape errors
+imgsz: 640  # inference size (pixels)
+
+# ROBUST AUGMENTATIONS (For Teacher Only)
+# These values are standard YOLOv8/v10 levels to maximize robustness.
+hsv_h: 0.015  # image HSV-Hue augmentation (fraction)
+hsv_s: 0.7  # ROBUST: image HSV-Saturation augmentation (fraction)
+hsv_v: 0.4  # ROBUST: image HSV-Value augmentation (fraction)
+degrees: 5.0  # ROBUST: image rotation (+/- deg) - Simulates roll/banking
+translate: 0.1  # image translation (+/- fraction)
+scale: 0.5  # ROBUST: image scale (+/- gain)
+shear: 2.0  # ROBUST: image shear (+/- deg) - Simulates motion distortion
+perspective: 0.0005  # ROBUST: image perspective (+/- fraction) - Simulates pitch
+flipud: 0.0  # image flip up-down (probability)
+fliplr: 0.5  # image flip left-right (probability)
+mosaic: 1.0  # ROBUST: image mosaic (probability) - Force context learning
+mixup: 0.1  # ROBUST: image mixup (probability) - Force generalization
+copy_paste: 0.0  # segment copy-paste (probability)
+auto_augment: randaugment # ROBUST: RandAugment for lighting/weather resilience

@@ -1,0 +1,53 @@
+# Virtual Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Agent Rules and Artifacts
+.agent/
+.gemini/
+.agent_rules
+
+# Tests and Debug
+.pytest_cache/
+tests/
+debug_*.py
+inspect_*.py
+repro_crash.py
+
+# Build and Compilation Artifacts
+build/
+dist/
+*.egg-info/
+
+# Training Outputs and Checkpoints
+runs/
+checkpoints/
+scratch/
+unina_dla_teacher_backup/
+*.pt
+*.pth
+
+# Model and Engine Artifacts
+*.onnx
+*.onnx.data
+*.engine
+*.plan
+calib.cache
+layer_info.json
+dla_log.txt
+*.log
+val_results_*.json
+
+# Datasets and Recordings
+data/
+datasets/
+*.mcap
+*.bag
+
+# OS / IDE Specific
+.DS_Store
+Thumbs.db
+.vscode/
+*_backup.ipynb

@@ -1,0 +1,801 @@
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Ensure repo root is on sys.path
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import torch
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
+from ultralytics.data import build_dataloader, build_yolo_dataset
+from ultralytics.utils import DEFAULT_CFG, IterableSimpleNamespace
+
+from unina_dla.engines.phase1_5_sparsity import run_sparsity_finetune
+from unina_dla.engines.phase1_classic import run_classic_training
+from unina_dla.engines.phase1_distill import run_distillation
+from unina_dla.engines.phase2_qat import run_qat
+from unina_dla.engines.phase3_export import run_export
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="UNINA-DLA Training Pipeline: Distillation -> Sparsity -> QAT -> Export"
+    )
+    parser.set_defaults(verify_dla=True)
+
+    # Dataset & Teacher
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="unina_dla/config/unina_dla_data.yaml",
+        help="Path to dataset.yaml",
+    )
+    parser.add_argument("--data_path", type=str, default=None, help="Override dataset root path")
+    parser.add_argument("--teacher", type=str, default=None, help="Path to teacher model .pt")
+    parser.add_argument("--imgsz", type=str, default="640", help="Image size: 640 or 768,480")
+    parser.add_argument(
+        "--imgsz_hw",
+        type=int,
+        nargs=2,
+        default=None,
+        help="[DEPRECATED] Image size (h w) for rectangular training. Use --imgsz instead.",
+    )
+    parser.add_argument("--batch", type=int, default=16, help="Batch size")
+    parser.add_argument("--workers", type=int, default=8, help="Num workers")
+    parser.add_argument("--device", type=str, default="0", help="Device (0, cpu)")
+    parser.add_argument("--name", type=str, default="exp", help="Experiment name")
+    parser.add_argument(
+        "--version",
+        type=str,
+        default=None,
+        choices=["2.5", "3.1", "2", "3"],
+        help="Architecture generation (defaults to 2.5 for fresh training, or auto-detected from checkpoint)",
+    )
+
+    # Phase 1: Distillation
+    parser.add_argument("--epochs", type=int, default=150, help="Phase 1 Epochs")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning Rate")
+    parser.add_argument(
+        "--enable_distillation", action="store_true", help="Enable Knowledge Distillation"
+    )
+    parser.add_argument(
+        "--skip_distillation", action="store_true", help="Skip Phase 1 (load existing checkpoint)"
+    )
+    parser.add_argument(
+        "--classic",
+        action="store_true",
+        help='Run in "Classic" Mode (Baseline training, no Distillation, no fancy loss)',
+    )
+    parser.add_argument("--resume", type=str, default=None, help="Resume Phase 1 from checkpoint")
+
+    # Fade Schedule (Teacher Fade)
+    parser.add_argument(
+        "--fade_start", type=float, default=0.8, help="Teacher Fade Start (1.0=Full Strength)"
+    )
+    parser.add_argument(
+        "--fade_end", type=float, default=0.1, help="Teacher Fade End (Decays to this minimum)"
+    )
+    parser.add_argument(
+        "--task_weight_start",
+        type=float,
+        default=0.35,
+        help="Task loss weight at distillation start (teacher-dominant if < 1.0)",
+    )
+    parser.add_argument(
+        "--task_weight_end",
+        type=float,
+        default=1.0,
+        help="Task loss weight at distillation end (GT authority)",
+    )
+
+    # O2O Assignment Curriculum (training-only; no deployment behavior change)
+    parser.add_argument(
+        "--o2o_topk_start", type=int, default=3, help="Early-phase TAL top-k for denser supervision"
+    )
+    parser.add_argument("--o2o_topk_mid", type=int, default=2, help="Mid-phase TAL top-k")
+    parser.add_argument(
+        "--o2o_topk_end", type=int, default=1, help="Final-phase TAL top-k (strict O2O)"
+    )
+    parser.add_argument(
+        "--o2o_topk_stage1_pct",
+        type=float,
+        default=0.15,
+        help="Progress threshold for switching start->mid top-k",
+    )
+    parser.add_argument(
+        "--o2o_topk_stage2_pct",
+        type=float,
+        default=0.35,
+        help="Progress threshold for switching mid->end top-k",
+    )
+    parser.add_argument(
+        "--o2m_aux_weight_start", type=float, default=0.8, help="Aux O2M task weight at phase start"
+    )
+    parser.add_argument(
+        "--o2m_aux_weight_end", type=float, default=0.0, help="Aux O2M task weight at phase end (0.0 for pure late O2O)"
+    )
+    parser.add_argument(
+        "--o2m_aux_weight_end_distill",
+        type=float,
+        default=0.0,
+        help="Aux O2M task weight at distillation phase end",
+    )
+    parser.add_argument(
+        "--o2m_aux_weight_sparse_qat",
+        type=float,
+        default=0.0,
+        help="Aux O2M task weight during sparsity/QAT (set 0.0 for strict late O2O)",
+    )
+    parser.add_argument(
+        "--o2m_topk",
+        type=int,
+        default=10,
+        help="TaskAlignedAssigner top-k for O2M auxiliary branch",
+    )
+    parser.add_argument(
+        "--dup_loss_weight",
+        type=float,
+        default=0.05,
+        help="Weight for O2O duplicate suppression ranking loss (set 0 to disable)",
+    )
+    parser.add_argument(
+        "--dup_iou_thr",
+        type=float,
+        default=0.6,
+        help="IoU threshold to mark negative anchors as local duplicates",
+    )
+    parser.add_argument(
+        "--dup_margin",
+        type=float,
+        default=0.2,
+        help="Ranking margin: positive logit should exceed duplicate negatives by this amount",
+    )
+    parser.add_argument(
+        "--dup_topk",
+        type=int,
+        default=20,
+        help="Max duplicate negatives sampled per GT for ranking loss",
+    )
+    parser.add_argument(
+        "--hard_bg_loss_weight",
+        type=float,
+        default=0.02,
+        help="Weight for hard background suppression (set 0 to disable)",
+    )
+    parser.add_argument(
+        "--hard_bg_iou_thr",
+        type=float,
+        default=0.2,
+        help="Max IoU to any GT for hard-background negatives",
+    )
+    parser.add_argument(
+        "--hard_bg_topk", type=int, default=64, help="Top-k hardest background negatives per image"
+    )
+    parser.add_argument(
+        "--dup_start_pct",
+        type=float,
+        default=0.6,
+        help="Training progress threshold to start ramping duplicate suppression",
+    )
+    parser.add_argument(
+        "--kd_mask_topk",
+        type=int,
+        default=1,
+        help="Top-k used to build teacher KD masks (recommended: 1 for strict O2O)",
+    )
+    parser.add_argument(
+        "--kd_assigner_parity",
+        action="store_true",
+        help="Use Ultralytics-style one2one assigner settings for KD masks",
+    )
+    parser.add_argument(
+        "--kd_parity_topk",
+        type=int,
+        default=7,
+        help="KD parity assigner top-k (Ultralytics one2one default)",
+    )
+    parser.add_argument(
+        "--kd_parity_topk2",
+        type=int,
+        default=1,
+        help="KD parity assigner top-k2 (Ultralytics one2one default)",
+    )
+    parser.add_argument(
+        "--max_det",
+        type=int,
+        default=300,
+        help="Maximum detections per image in validation postprocess",
+    )
+    parser.add_argument(
+        "--deploy_eval_conf",
+        type=float,
+        default=0.25,
+        help="Confidence threshold for deployment-style O2O vs NMS validation",
+    )
+    parser.add_argument(
+        "--deploy_eval_iou",
+        type=float,
+        default=0.6,
+        help="IoU threshold for deployment-style NMS validation",
+    )
+    parser.add_argument(
+        "--tb_log_every",
+        type=int,
+        default=10,
+        help="TensorBoard scalar logging interval in optimizer steps",
+    )
+    parser.add_argument(
+        "--tb_detail_every",
+        type=int,
+        default=50,
+        help="TensorBoard interval for detailed diagnostic scalars",
+    )
+
+    # Per-Vector KD Component Weights (relative to global teacher fade)
+    parser.add_argument(
+        "--kd_sdf_start", type=float, default=1.0, help="SDF KD multiplier at phase start"
+    )
+    parser.add_argument(
+        "--kd_sdf_end", type=float, default=1.0, help="SDF KD multiplier at phase end"
+    )
+    parser.add_argument(
+        "--kd_logit_start", type=float, default=1.0, help="Logit KD multiplier at phase start"
+    )
+    parser.add_argument(
+        "--kd_logit_end", type=float, default=0.9, help="Logit KD multiplier at phase end"
+    )
+    parser.add_argument(
+        "--kd_box_start", type=float, default=1.0, help="Box KD multiplier at phase start"
+    )
+    parser.add_argument(
+        "--kd_box_end", type=float, default=0.5, help="Box KD multiplier at phase end"
+    )
+    parser.add_argument(
+        "--kd_mech_all",
+        action="store_true",
+        help="Enable all KD mechanisms (cross-head + global relation)",
+    )
+    parser.add_argument(
+        "--kd_mech_cross_head",
+        action="store_true",
+        help="Enable CrossKD-style routed teacher-head supervision",
+    )
+    parser.add_argument(
+        "--kd_cross_head_weight",
+        type=float,
+        default=0.15,
+        help="Weight for routed cross-head KD terms",
+    )
+    parser.add_argument(
+        "--kd_mech_global_rel",
+        action="store_true",
+        help="Enable global relation distillation inside SDF KD",
+    )
+    parser.add_argument(
+        "--kd_global_rel_weight",
+        type=float,
+        default=0.10,
+        help="Weight for SDF global relation term",
+    )
+    parser.add_argument(
+        "--kd_global_rel_tokens",
+        type=int,
+        default=256,
+        help="Max spatial tokens used for global relation pooling",
+    )
+
+    # Phase 1.5: Sparsity
+    parser.add_argument(
+        "--enable_sparsity", action="store_true", help="Enable 2:4 Structured Sparsity (NVIDIA ASP)"
+    )
+    parser.add_argument(
+        "--epochs_sparsity",
+        type=int,
+        default=None,
+        help="Sparsity Fine-tuning Epochs (Default: 20%% of Phase 1, clipped [1, 30])",
+    )
+    parser.add_argument(
+        "--skip_sparsity", action="store_true", help="Skip Sparsity Phase (if resuming QAT)"
+    )
+    parser.add_argument("--bn_batches", type=int, default=200, help="Batches for BN Re-estimation")
+
+    # Phase 2: QAT
+    parser.add_argument("--enable_qat", action="store_true", help="Enable QAT")
+    parser.add_argument(
+        "--epochs_qat",
+        type=int,
+        default=None,
+        help="QAT Epochs (Default: 10%% of Phase 1, clipped [1, 30])",
+    )
+    parser.add_argument("--resume_qat", type=str, default=None, help="Resume QAT from checkpoint")
+    parser.add_argument("--calib_batches", type=int, default=200, help="QAT Calibration Batches")
+    parser.add_argument(
+        "--qat-clean-deploy",
+        action="store_true",
+        help="Export a clean deploy ONNX from the QAT checkpoint by stripping fake-quant/QDQ state",
+    )
+
+    # Output
+    parser.add_argument(
+        "--project",
+        type=str,
+        default="unina_dla_student",
+        help="Output project directory (can be absolute path for Colab/Drive)",
+    )
+    parser.add_argument(
+        "--verify-dla",
+        action="store_true",
+        dest="verify_dla",
+        help="Run strict DLA ONNX verification after export (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-verify-dla",
+        action="store_false",
+        dest="verify_dla",
+        help="Skip strict DLA ONNX verification after export",
+    )
+
+    parser.add_argument(
+        "--amp", action="store_true", default=True, help="Enable Automatic Mixed Precision (AMP)"
+    )
+    parser.add_argument("--no-amp", action="store_false", dest="amp", help="Disable AMP")
+    parser.add_argument(
+        "--compile", action="store_true", default=True, help="Enable torch.compile (PyTorch 2.0+)"
+    )
+    parser.add_argument(
+        "--no-compile", action="store_false", dest="compile", help="Disable torch.compile"
+    )
+
+    args = parser.parse_args()
+
+    if args.kd_mech_all:
+        args.kd_mech_cross_head = True
+        args.kd_mech_global_rel = True
+
+    # Hardware
+    if torch.cuda.is_available() and args.device != "cpu":
+        device = torch.device(f"cuda:{args.device}")
+        torch.backends.cudnn.benchmark = True
+    else:
+        device = torch.device("cpu")
+    print(f"Using device: {device}")
+
+    # Resolution Handling
+    # Support both --imgsz "768,480" (str) and legacy --imgsz_hw logic
+    if args.imgsz_hw is None:
+        if isinstance(args.imgsz, str) and ("," in args.imgsz or "x" in args.imgsz):
+            delim = "," if "," in args.imgsz else "x"
+            parts = [int(x.strip()) for x in args.imgsz.split(delim) if x.strip()]
+            if len(parts) == 2:
+                # Widescreen format (W, H), e.g. 768,480 -> canonical (H, W) is (480, 768)
+                if parts[0] > parts[1]:
+                    args.imgsz_hw = (parts[1], parts[0])
+                else:
+                    args.imgsz_hw = (parts[0], parts[1])
+            else:
+                raise ValueError(
+                    f"Invalid format for --imgsz: {args.imgsz}. Expected 'w,h' or single int."
+                )
+        else:
+            val = int(args.imgsz)
+            args.imgsz_hw = (val, val)
+    print(f"Training Resolution (H, W): {args.imgsz_hw}")
+
+    # Proportional epoch scheduling for fine-tuning phases
+    # If user doesn't specify epochs, calculate dynamically based on Phase 1 length
+
+    def calculate_finetune_epochs(base_epochs, pct=0.10):
+        raw_pct = int(base_epochs * pct)
+        # Guard Rails: Min 1, Max 30
+        return max(1, min(raw_pct, 30))
+
+    if args.epochs_sparsity is None:
+        args.epochs_sparsity = calculate_finetune_epochs(args.epochs, pct=0.20)
+        print(
+            f"[Dynamic Epochs] Sparsity set to {args.epochs_sparsity} epochs (20% of {args.epochs})"
+        )
+
+    if args.epochs_qat is None:
+        args.epochs_qat = calculate_finetune_epochs(args.epochs, pct=0.10)
+        print(f"[Dynamic Epochs] QAT set to {args.epochs_qat} epochs (10% of {args.epochs})")
+
+    def validate_dual_head_checkpoint(path):
+        ckpt_local = torch.load(path, map_location="cpu")
+        model_sd = (
+            ckpt_local["model"]
+            if isinstance(ckpt_local, dict) and "model" in ckpt_local
+            else ckpt_local
+        )
+        required = (
+            "head.o2o_reg_preds.0.0.weight",
+            "head.o2m_reg_preds.0.0.weight",
+        )
+        missing = [k for k in required if k not in model_sd]
+        if missing:
+            raise ValueError(
+                f"Checkpoint '{path}' is pre-dual-head and incompatible with this training pipeline. "
+                "Retrain from scratch or provide a dual-head checkpoint."
+            )
+
+    # Experiment Setup
+    # Construct final output path (handles both absolute and relative paths)
+    args.output_dir = os.path.join(args.project, args.name)
+    os.makedirs(args.output_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=args.output_dir) if SummaryWriter is not None else None
+    args.tb_step_offset = 0
+    args.tb_epoch_offset = 0
+
+    # Data Setup
+    print("Initializing Datasets...")
+    data_cfg = IterableSimpleNamespace(**DEFAULT_CFG.__dict__)
+    data_cfg.data = args.data
+    data_cfg.imgsz = max(args.imgsz_hw)  # Use max dim for build_yolo_dataset checks
+
+    # Use Ultralytics generic dataset builder
+    manual_load = False
+    try:
+        from ultralytics.data.utils import check_det_dataset
+
+        data_cfg_dict = check_det_dataset(args.data)
+    except Exception as e:
+        print(f"Warning: check_det_dataset failed ({e}). Falling back to manual loading.")
+        manual_load = True
+        import yaml
+
+        with open(args.data) as f:
+            data_cfg_dict = yaml.safe_load(f)
+
+    # Expand user path '~' if present in 'path'
+    if "path" in data_cfg_dict and isinstance(data_cfg_dict["path"], str):
+        data_cfg_dict["path"] = os.path.expanduser(data_cfg_dict["path"])
+
+    # Handle dataset path override OR resolve paths if manual load was used
+    if args.data_path or manual_load:
+        if args.data_path:
+            print(f"Overriding dataset root path with: {args.data_path}")
+            data_cfg_dict["path"] = args.data_path
+
+        root_path = data_cfg_dict.get("path", "")
+
+        # Robustly resolve paths
+        for k in ["train", "val", "test"]:
+            if k in data_cfg_dict:
+                path_val = data_cfg_dict[k]
+                if isinstance(path_val, str) and not os.path.isabs(path_val):
+                    # If it's just a filename or relative path, prepend new root
+                    data_cfg_dict[k] = os.path.join(root_path, path_val)
+
+                # Check existence to warn early
+                if isinstance(data_cfg_dict[k], str) and not os.path.exists(data_cfg_dict[k]):
+                    # Check common directory variations if path does not exist
+                    fallbacks = {
+                        "val": [
+                            "val/images",
+                            "valid/images",
+                            "validation/images",
+                            "val",
+                            "valid",
+                            "validation",
+                        ],
+                        "test": ["test/images", "testing/images", "test", "testing"],
+                    }
+                    if k in fallbacks:
+                        found = False
+                        for fb in fallbacks[k]:
+                            fb_path = os.path.join(root_path, fb)
+                            if os.path.exists(fb_path):
+                                print(f"Found {k} split at fallback: {fb_path}")
+                                data_cfg_dict[k] = fb_path
+                                found = True
+                                break
+                        if not found and k == "test":
+                            print("Warning: Test set path not found. Disabling testing.")
+                            del data_cfg_dict[k]
+                        elif not found:
+                            print(f"Warning: {k} set path not found at {data_cfg_dict[k]}")
+
+                # Pre-verification for Train set
+                if (
+                    k == "train"
+                    and isinstance(data_cfg_dict[k], str)
+                    and not os.path.exists(data_cfg_dict[k])
+                ):
+                    print(f"Error: Train set not found at {data_cfg_dict[k]}!")
+
+    # Pass 'rect=True' for rectangular training if aspect ratio is non-square
+    is_rect = args.imgsz_hw[0] != args.imgsz_hw[1]
+
+    # Build Train Loader
+    train_set = build_yolo_dataset(
+        data_cfg,
+        data_cfg_dict["train"],
+        batch=args.batch,
+        data=data_cfg_dict,
+        mode="train",
+        rect=is_rect,
+        stride=32,
+    )
+    # When rect=True, shuffle must be False to preserve aspect-ratio batching
+    shuffle_mode = not is_rect
+    if is_rect:
+        print(
+            "[Info] Rectangular training enabled: Disabling shuffle to maintain batch aspect ratios."
+        )
+    train_loader = build_dataloader(
+        train_set, batch=args.batch, workers=args.workers, shuffle=shuffle_mode
+    )
+
+    # Build Val Loader
+    val_set = build_yolo_dataset(
+        data_cfg,
+        data_cfg_dict["val"],
+        batch=args.batch,
+        data=data_cfg_dict,
+        mode="val",
+        rect=is_rect,
+        stride=32,
+    )
+    val_loader = build_dataloader(val_set, batch=args.batch, workers=args.workers, shuffle=False)
+
+    def _advance_tb_offsets(active_loader, phase_epochs):
+        phase_epochs = max(int(phase_epochs), 0)
+        if phase_epochs <= 0 or active_loader is None:
+            return
+        try:
+            loader_len = int(len(active_loader))
+        except Exception:
+            loader_len = 0
+        args.tb_step_offset = int(getattr(args, "tb_step_offset", 0)) + (loader_len * phase_epochs)
+        args.tb_epoch_offset = int(getattr(args, "tb_epoch_offset", 0)) + phase_epochs
+
+    # ---------------------------------------------------------
+    # Phase 1: Distillation / Standalone
+    # ---------------------------------------------------------
+    phase1_ckpt = None
+    phase1_ran = False
+
+    if args.resume and not args.skip_distillation:
+        print(f"Resuming Phase 1 from {args.resume}...")
+        phase1_ckpt = run_distillation(
+            args, device, data_cfg_dict, train_loader, val_loader, writer
+        )
+        phase1_ran = True
+    elif args.skip_distillation:
+        if args.resume and os.path.exists(args.resume):
+            validate_dual_head_checkpoint(args.resume)
+            print(f"Skipping Phase 1, using checkpoint: {args.resume}")
+            phase1_ckpt = args.resume
+        else:
+            raise ValueError("Skip distillation requested but no resume checkpoint provided!")
+    elif args.classic:
+        phase1_ckpt = run_classic_training(
+            args, device, data_cfg_dict, train_loader, val_loader, writer
+        )
+        phase1_ran = True
+    else:
+        # Phase 1 Engine handles both distillation and standalone training
+        phase1_ckpt = run_distillation(
+            args, device, data_cfg_dict, train_loader, val_loader, writer
+        )
+        phase1_ran = True
+
+    if phase1_ran:
+        _advance_tb_offsets(train_loader, args.epochs)
+
+    # Check if checkpoint already has sparsity enabled
+    try:
+        ckpt_tmp = torch.load(phase1_ckpt, map_location="cpu")
+        checkpoint_has_sparsity = ckpt_tmp.get("sparsity_enabled", False)
+        del ckpt_tmp
+    except Exception:
+        checkpoint_has_sparsity = False
+
+    # ---------------------------------------------------------
+    # Phase 1.5: Sparsity Fine-Tuning
+    # ---------------------------------------------------------
+    sparse_ckpt = phase1_ckpt
+    sparse_ran = False
+
+    if args.enable_sparsity:
+        if args.skip_sparsity:
+            print("Skipping Sparsity Phase (per flag).")
+        elif checkpoint_has_sparsity:
+            print("Checkpoint already has sparsity enabled. Skipping Phase 1.5.")
+        else:
+            sparse_ckpt = run_sparsity_finetune(
+                args, device, data_cfg_dict, train_loader, val_loader, phase1_ckpt, writer
+            )
+            sparse_ran = True
+
+    if sparse_ran:
+        _advance_tb_offsets(train_loader, args.epochs_sparsity)
+
+    # ---------------------------------------------------------
+    # Phase 2: QAT
+    # ---------------------------------------------------------
+    qat_ckpt = sparse_ckpt
+    qat_ran = False
+
+    if args.enable_qat:
+        # QAT Dataloader Logic:
+        # QAT needs CLEAN data (no Mosaic) to stabilize calibration and quantization.
+        print("[QAT] Rebuilding dataloader with Mosaic=0.0 for clean fine-tuning...")
+
+        # Distinguish between unaugmented calibration (handled separately on val/calib dataset)
+        # and QAT fine-tuning augmentations (keep mild geometric & photometric transforms).
+        import copy
+
+        qat_hyp = copy.deepcopy(data_cfg)
+        qat_hyp.mosaic = 0.0  # Disable heavy multi-image blending for QAT
+        qat_hyp.mixup = 0.0
+        qat_hyp.copy_paste = 0.0
+        # Retain mild fine-tuning augmentations to prevent overfitting on quantized weights
+        qat_hyp.scale = float(getattr(data_cfg, "scale", 0.5)) * 0.4  # mild scale (e.g. 0.2)
+        qat_hyp.translate = float(getattr(data_cfg, "translate", 0.1)) * 0.5  # mild translation
+        qat_hyp.fliplr = float(getattr(data_cfg, "fliplr", 0.5))
+        qat_hyp.hsv_h = float(getattr(data_cfg, "hsv_h", 0.015))
+        qat_hyp.hsv_s = float(getattr(data_cfg, "hsv_s", 0.7))
+        qat_hyp.hsv_v = float(getattr(data_cfg, "hsv_v", 0.4))
+        qat_hyp.degrees = 0.0
+        qat_hyp.close_mosaic = 0
+
+        # REBUILD the dataset and loader with properly updated hyp namespace
+        qat_train_set = build_yolo_dataset(
+            qat_hyp,
+            data_cfg_dict["train"],
+            batch=args.batch,
+            data=data_cfg_dict,
+            mode="train",
+            rect=is_rect,
+            stride=32,
+        )
+        # Reassign to train_loader so run_qat uses the new one
+        train_loader = build_dataloader(
+            qat_train_set, batch=args.batch, workers=args.workers, shuffle=shuffle_mode
+        )
+
+        initial_qat_ckpt = args.resume_qat if args.resume_qat else sparse_ckpt
+        if args.resume_qat:
+            validate_dual_head_checkpoint(args.resume_qat)
+            print(f"Resuming QAT from {args.resume_qat}...")
+
+        qat_ckpt = run_qat(
+            args, device, data_cfg_dict, train_loader, val_loader, initial_qat_ckpt, writer
+        )
+        qat_ran = True
+
+    if qat_ran:
+        _advance_tb_offsets(train_loader, args.epochs_qat)
+
+    # ---------------------------------------------------------
+    # Phase 3: Export to ONNX (DLA-Optimized)
+    # ---------------------------------------------------------
+    # The run_export logic will auto-detect best checkpoint if args.checkpoint is None
+    if args.classic:
+        current_ckpt = os.path.join(args.output_dir, "best_classic.pth")
+        args.checkpoint = current_ckpt
+
+    _best_exported_onnx = run_export(args)
+
+    # ---------------------------------------------------------
+    # Phase 4: Final Test Set Evaluation (Optional)
+    # ---------------------------------------------------------
+    if "test" in data_cfg_dict and data_cfg_dict["test"]:
+        print("\n" + "=" * 60)
+        print("PHASE 4: FINAL EVALUATION ON TEST SET")
+        print("=" * 60)
+
+        test_path = data_cfg_dict["test"]
+        print(f"Building Test Loader from: {test_path}")
+
+        try:
+            test_set = build_yolo_dataset(
+                data_cfg,
+                test_path,
+                batch=args.batch,
+                data=data_cfg_dict,
+                mode="val",
+                rect=is_rect,
+                stride=32,
+            )
+            test_loader = build_dataloader(
+                test_set, batch=args.batch, workers=args.workers, shuffle=False
+            )
+
+            # Load Best Available Model (Prioritize ONNX for speed/verification, else PyTorch)
+            # Actually Validator works best with PyTorch model wrapper or ONNX Runtime.
+            # Our custom validator works with PyTorch model wrapper.
+            # Let's use the best PyTorch checkpoint to ensure compatibility with our custom validator/metrics code.
+            # (Export verifiers can run elsewhere).
+
+            final_ckpt = (
+                qat_ckpt
+                if args.enable_qat
+                else (sparse_ckpt if args.enable_sparsity else phase1_ckpt)
+            )
+            print(f"Loading best checkpoint for testing: {final_ckpt}")
+
+            # Re-init model
+            from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+
+            num_classes = data_cfg_dict.get("nc", 4)
+
+            # Detect architecture from checkpoint
+            ckpt = torch.load(final_ckpt, map_location=device)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            is_fused = any("rbr_reparam" in k for k in state_dict.keys())
+            detected_ver = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
+
+            test_model = UNINA_DLA(num_classes=num_classes, deploy=is_fused, version=detected_ver).to(device)
+
+            # Reconstruct QAT modules before loading checkpoint to preserve quantizer state.
+            if args.enable_qat:
+                from unina_dla.utils.qat_utils import enable_quantization, prepare_qat_model
+
+                test_model = prepare_qat_model(
+                    test_model,
+                    verification_input_size=(1, 3, args.imgsz_hw[0], args.imgsz_hw[1]),
+                )
+                test_model.load_state_dict(state_dict, strict=False)
+                enable_quantization(test_model)
+            else:
+                test_model.load_state_dict(state_dict, strict=False)
+
+            test_model.eval()
+
+            print("Running Test Set Validation...")
+            from unina_dla.utils.validator import validate
+
+            # Force NMS for Classic Mode (O2M Training)
+            use_nms = True if args.classic else None
+
+            # Lineage-based Prefixing
+            lineage_prefix = "classic_" if args.classic else "distilled_"
+            if args.enable_sparsity:
+                lineage_prefix += "sparse_"
+            if args.enable_qat:
+                lineage_prefix += "qat_"
+
+            test_prefix = f"{lineage_prefix}TEST_"
+
+            results, _ = validate(
+                test_model,
+                test_loader,
+                device=device,
+                num_classes=num_classes,
+                names=data_cfg.get("names", {}),
+                save_dir=args.output_dir,
+                prefix=test_prefix,
+                nms=use_nms,
+                max_det=int(getattr(args, "max_det", 300)),
+            )
+
+            print(f"\nFinal Test Set mAP50: {results['mAP50']:.4f}")
+            print(f"Final Test Set mAP50-95: {results['mAP50-95']:.4f}")
+
+            # Save to file with dynamic name
+            metrics_save_path = os.path.join(args.output_dir, f"{lineage_prefix}test_metrics.txt")
+            with open(metrics_save_path, "w") as f:
+                f.write(f"mAP50: {results['mAP50']}\n")
+                f.write(f"mAP50-95: {results['mAP50-95']}\n")
+
+        except Exception as e:
+            print(f"[Warning] Failed to run test set evaluation: {e}")
+            print("Skipping testing phase.")
+    else:
+        print("[Info] No test set defined or found. Skipping Phase 4.")
+
+    if writer is not None:
+        writer.flush()
+        writer.close()
+
+
+if __name__ == "__main__":
+    main()

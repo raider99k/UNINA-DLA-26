@@ -1,0 +1,90 @@
+# ==============================================================================
+# UNINA-DLA: Formula Student Driverless (FSD) Reference Configuration
+# ==============================================================================
+# Dedicated reference configuration capturing the canonical Formula Student
+# cone detection setup for 100% DLA residency on NVIDIA Jetson Orin.
+
+# ------------------------------------------------------------------------------
+# Dataset & Class Specification
+# ------------------------------------------------------------------------------
+# Canonical class ordering aligned across PyTorch, C++ deployment, and YAML:
+#   0: Yellow Cone
+#   1: Blue Cone
+#   2: Small Orange Cone
+#   3: Large Orange Cone
+nc: 4
+names:
+  0: yellow_cone
+  1: blue_cone
+  2: small_orange_cone
+  3: large_orange_cone
+
+# Display / Visualization names (human-readable)
+class_names:
+  - "Yellow"
+  - "Blue"
+  - "SmallOrange"
+  - "LargeOrange"
+
+# Dataset root and splits (adjust path to local dataset location)
+path: datasets/formula_student_cones
+train: images/train
+val: images/val
+test: images/test
+
+# ------------------------------------------------------------------------------
+# Resolution & Sensor Optimization (ZED X 2.2mm Lens)
+# ------------------------------------------------------------------------------
+# Default input dimensions (Height x Width, multiples of 32 for DLA alignment)
+input_height: 608
+input_width: 960
+imgsz: [608, 960]
+
+# Supported 16:10 aspect ratio resolutions matching ZED X native optics:
+#   - [320, 512]  : Ultra-low latency profiling / host testing
+#   - [480, 768]  : Balanced throughput and range
+#   - [608, 960]  : Recommended racing operational point (SVGA 960x600 native base)
+#   - [640, 1024] : Maximum detection range (>25m detection of 23cm cones)
+recommended_resolutions:
+  fast: [320, 512]
+  balanced: [480, 768]
+  optimal_racing: [608, 960]
+  extended_range: [640, 1024]
+
+# Camera hardware parameters
+camera:
+  sensor: "Stereolabs ZED X"
+  lens: "2.2mm ultra-wide"
+  native_resolution: "SVGA"
+  target_fps: 60
+  depth_mode: "PERFORMANCE"
+  depth_enabled: true
+
+# ------------------------------------------------------------------------------
+# Deployment & Inference Thresholds
+# ------------------------------------------------------------------------------
+# Pure one-to-one (O2O) direct regression enables NMS-free execution
+conf_threshold: 0.25
+score_threshold: 0.45
+use_nms: false
+nms_iou_threshold: 0.60
+max_detections: 1000
+
+# ------------------------------------------------------------------------------
+# Training & Augmentation Hyperparameters (Outdoor Track Robustness)
+# ------------------------------------------------------------------------------
+# Tuned for outdoor racetrack environments with varying glare, sun angle, and shadows
+hsv_h: 0.010       # Subtle hue shifts (asphalt and lighting color shifts)
+hsv_s: 0.35        # Moderate saturation shifts (direct sun vs overcast)
+hsv_v: 0.20        # Exposure / brightness adjustments (track shadows)
+degrees: 2.0       # Slight roll / chassis pitch variation
+translate: 0.05    # Bounding box translation jitter
+scale: 0.20        # Scale augmentation for distant and close cones
+shear: 0.5         # Perspective shear
+perspective: 0.0   # Disable non-affine perspective distortion for stability
+flipud: 0.0        # Cones never appear upside down; vertical flip disabled
+fliplr: 0.5        # Track symmetry allows horizontal flipping
+mosaic: 0.3        # Moderate mosaic to prevent sample distortion
+mixup: 0.0         # Disabled to preserve crisp cone boundary geometry
+copy_paste: 0.0    # Segment copy-paste disabled
+auto_augment: none # Explicit deterministic pipeline
