@@ -15,7 +15,7 @@ from unina_dla.model.losses.distillation_losses import (
     SDFDistillationLoss,
 )
 from unina_dla.model.teacher_model import get_teacher_model
-from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.sparsity_utils import (
     create_zero_clamp_hook,
     create_zero_grad_hook,
@@ -48,8 +48,6 @@ def bn_reestimate(model, loader, device, num_batches=200):
     """
     Handle post-pruning normalization and calibration:
     - If BatchNorm2d modules exist, re-estimate running mean/variance.
-    - If fused Conv2d deployment architecture (0 BatchNorm2d layers), perform
-      data-driven activation calibration and bias compensation across calibration batches.
     """
     bn_modules = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
     if bn_modules:
@@ -68,46 +66,6 @@ def bn_reestimate(model, loader, device, num_batches=200):
             model(imgs)
             count += 1
         print("BN Re-estimation Complete.")
-        return
-
-    # Fused Conv2d deployment architecture: data-driven activation calibration
-    conv_modules = [m for m in model.modules() if isinstance(m, nn.Conv2d) and m.bias is not None]
-    if not conv_modules:
-        return
-
-    print(f"[Sparse Calibration] Calibrating activation distributions and compensating bias for {len(conv_modules)} fused Conv2d layers ({num_batches} batches)...")
-    model.eval()
-    shifts = {m: [] for m in conv_modules}
-    hooks = []
-
-    for m in conv_modules:
-        def make_hook(mod):
-            def hook_fn(module, inp, out):
-                with torch.no_grad():
-                    shifts[mod].append(out.detach().mean(dim=(0, 2, 3)))
-            return hook_fn
-        hooks.append(m.register_forward_hook(make_hook(m)))
-
-    count = 0
-    for batch in loader:
-        if count >= num_batches:
-            break
-        imgs = batch["img"].to(device).float() / 255.0
-        model(imgs)
-        count += 1
-
-    for h in hooks:
-        h.remove()
-
-    adjusted_count = 0
-    for m, stat_list in shifts.items():
-        if stat_list and m.bias is not None:
-            mean_channel_out = torch.stack(stat_list, dim=0).mean(dim=0)
-            correction = (mean_channel_out * 0.05).clamp(min=-0.1, max=0.1)
-            m.bias.data.add_(correction)
-            adjusted_count += 1
-
-    print(f"[Sparse Calibration] Applied activation calibration across {adjusted_count} fused Conv2d layers.")
 
 
 def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writer):
@@ -120,16 +78,29 @@ def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, dist
     # 1. Load Student Checkpoint and Detect Architecture Generation
     print(f"Loading Student from {distill_ckpt}...")
     ckpt = torch.load(distill_ckpt, map_location=device, weights_only=False)
-    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+    state_dict = (
+        ckpt.get("ema", ckpt["model"])
+        if "ema" in ckpt
+        else (ckpt["model"] if "model" in ckpt else ckpt)
+    )
     _validate_dual_head_state_dict(state_dict, distill_ckpt)
-    # Filter profiling
-    profiling_keys = [k for k in state_dict.keys() if k.endswith(("total_ops", "total_params"))]
-    for k in profiling_keys:
-        del state_dict[k]
+    # Filter profiling and strip compiler wrappers (_orig_mod.)
+    state_dict = {
+        k.replace("_orig_mod.", ""): v
+        for k, v in state_dict.items()
+        if not k.endswith(("total_ops", "total_params"))
+    }
 
+    is_fused = any("rbr_reparam" in k for k in state_dict.keys())
     arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
-    student = UNINA_DLA(num_classes=nc_data, deploy=False, version=arch_version).to(device)
-    print(f"Student initialized with {nc_data} classes (YOLO26 Head, Gen-{arch_version}).")
+    up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
+    student = UNINA_DLA(
+        num_classes=nc_data, deploy=is_fused, version=arch_version, upsample_mode=up_mode
+    ).to(device)
+    print(
+        f"Student initialized with {nc_data} classes (YOLO26 Head, Gen-{arch_version}, "
+        f"upsample={student.upsample_mode}, fused={is_fused})."
+    )
     student.load_state_dict(state_dict, strict=True)
 
     # 2. Setup Teacher
@@ -138,16 +109,17 @@ def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, dist
         print(f"Loading Teacher from {args.teacher}...")
         teacher_wrapper = get_teacher_model(args.teacher)
 
-    # 3. Setup Optimizer (AdamW for sparsity)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-4, weight_decay=1e-5)
-
-    # 4. Fuse RepVGG
-    print("Fusing RepVGG blocks...")
-    student.eval()
-    student.switch_to_deploy()
+    # 3. Fuse RepVGG before optimizer setup so optimizer tracks fused rbr_reparam Conv2d weights
+    if not is_fused:
+        print("Fusing RepVGG blocks...")
+        student.eval()
+        student.switch_to_deploy()
     student.deploy = False
     if hasattr(student, "head") and hasattr(student.head, "deploy"):
         student.head.deploy = False
+
+    # 4. Setup Optimizer (AdamW for sparsity)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=1e-4, weight_decay=1e-5)
 
     # 5. Apply Sparsity
     student = enable_sparsity(student, optimizer, verbosity=2)
@@ -299,44 +271,43 @@ def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, dist
 
     # Resume
     start_epoch = 0
-    if (
-        args.resume and not args.skip_distillation
-    ):  # Reuse skip flag or add new one? usually just check args.resume
-        if os.path.isfile(args.resume):
-            print(f"Resuming Sparsity Training from {args.resume}")
-            ckpt = torch.load(args.resume, map_location=device)
-            state_dict = ckpt["model"] if "model" in ckpt else ckpt
-            _validate_dual_head_state_dict(state_dict, args.resume)
+    resume_target = getattr(args, "resume_sparsity", None)
+    if resume_target and os.path.isfile(resume_target):
+        print(f"Resuming Sparsity Training from {resume_target}")
+        ckpt = torch.load(resume_target, map_location=device)
+        state_dict = (
+            ckpt.get("ema", ckpt["model"])
+            if "ema" in ckpt
+            else (ckpt["model"] if "model" in ckpt else ckpt)
+        )
+        _validate_dual_head_state_dict(state_dict, resume_target)
 
-            # Key: We might have loaded distill_ckpt earlier, but this resume ckpt
-            # should be from the sparsity phase, so it overrides everything.
-            if "model" in ckpt:
-                student.load_state_dict(ckpt["model"])
-            if "optimizer" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer"])
-            if "scheduler" in ckpt:
-                scheduler.load_state_dict(ckpt["scheduler"])
-            if "adapters" in ckpt:
-                adapters.load_state_dict(ckpt["adapters"])
-            if "epoch" in ckpt:
-                start_epoch = ckpt["epoch"] + 1
-            if "balancer" in ckpt and loss_balancer:
-                loss_balancer.load_state_dict(ckpt["balancer"])
-            if "task_loss" in ckpt:
-                task_loss_fn.loss_fn.load_state_dict(ckpt["task_loss"])
-            if "task_loss_o2m" in ckpt:
-                try:
-                    task_loss_fn.o2m_loss_fn.load_state_dict(ckpt["task_loss_o2m"], strict=False)
-                except Exception as e:
-                    print(f"[Warning] Could not fully restore O2M task loss state: {e}")
-            if "scaler" in ckpt and scaler:
-                scaler.load_state_dict(ckpt["scaler"])
-            if "ema" in ckpt and ema:
-                ema.ema.load_state_dict(ckpt["ema"])
+        student.load_state_dict(state_dict, strict=False)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "adapters" in ckpt:
+            adapters.load_state_dict(ckpt["adapters"])
+        if "epoch" in ckpt:
+            start_epoch = ckpt["epoch"] + 1
+        if "balancer" in ckpt and loss_balancer:
+            loss_balancer.load_state_dict(ckpt["balancer"])
+        if "task_loss" in ckpt:
+            task_loss_fn.loss_fn.load_state_dict(ckpt["task_loss"])
+        if "task_loss_o2m" in ckpt:
+            try:
+                task_loss_fn.o2m_loss_fn.load_state_dict(ckpt["task_loss_o2m"], strict=False)
+            except Exception as e:
+                print(f"[Warning] Could not fully restore O2M task loss state: {e}")
+        if "scaler" in ckpt and scaler:
+            scaler.load_state_dict(ckpt["scaler"])
+        if "ema" in ckpt and ema:
+            ema.ema.load_state_dict(ckpt["ema"])
 
-            print(f"Resumed from Epoch {start_epoch}")
-        else:
-            print(f"[Warning] Resume file not found: {args.resume}")
+        print(f"Resumed from Epoch {start_epoch}")
+    elif resume_target:
+        print(f"[Warning] Resume file not found: {resume_target}")
 
     best_ckpt = None
     for epoch in range(start_epoch, args.epochs_sparsity):
@@ -353,26 +324,5 @@ def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, dist
         print("✓ All layers pass 2:4 sparsity verification.")
     else:
         print("✗ WARNING: Some layers failed sparsity verification!")
-
-    # Final BatchNorm re-estimation on best checkpoint to align statistics
-    if best_ckpt and os.path.exists(best_ckpt):
-        print(f"\n[Sparsity] Loading best checkpoint {best_ckpt} for BN re-estimation...")
-        ckpt = torch.load(best_ckpt, map_location=device)
-        # Prefer EMA model if present since best_map validation evaluated EMA
-        state_dict = ckpt.get("ema", ckpt["model"]) if "ema" in ckpt else ckpt["model"]
-        # Unwrap torch.compile's OptimizedModule wrapper before loading
-        real_student = student._orig_mod if hasattr(student, "_orig_mod") else student
-        real_student.load_state_dict(state_dict)
-
-        bn_reestimate(
-            real_student, calib_loader, device, num_batches=min(len(calib_loader), args.bn_batches)
-        )
-
-        # Update checkpoint
-        ckpt["model"] = real_student.state_dict()
-        if "ema" in ckpt:
-            ckpt["ema"] = real_student.state_dict()
-        torch.save(ckpt, best_ckpt)
-        print("[Sparsity] Best checkpoint updated with re-estimated BN stats.")
 
     return best_ckpt

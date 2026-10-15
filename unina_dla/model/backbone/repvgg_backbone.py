@@ -46,7 +46,7 @@ class DLASPPF(nn.Module):
 class RepVGGBackbone(nn.Module):
     """
     RepVGG Backbone optimized for DLA (ReLU only).
-    Supports standard RepVGG-B0 block layout as well as rebalanced racing depths
+    Supports standard RepVGG-A1 block layout [2, 4, 14, 1] as well as rebalanced racing depths
     and optional DLA-native SPPF pooling.
     """
 
@@ -57,6 +57,7 @@ class RepVGGBackbone(nn.Module):
         num_blocks=(2, 4, 14, 1),
         stage_channels=(64, 128, 256, 256),
         use_sppf=True,
+        stage4_groups=None,
     ):
         super().__init__()
         self.deploy = deploy
@@ -84,8 +85,12 @@ class RepVGGBackbone(nn.Module):
         self.stages.append(layer3)
 
         # Stage 4: layer4 (P5)
-        # Use groups=2 when channels=512 to keep weights under 1MB CBUF limit (1.18MB -> 0.59MB)
-        groups = 2 if stage_channels[3] >= 512 else 1
+        # Gen 2.6 uses stage4_groups=1 (hardware-verified CBUF residency: wtBanks=1, minDataBanks=2 <= 16)
+        # Gen 2.5 uses stage4_groups=2 for legacy 1MB theoretical weight limit compliance
+        if stage4_groups is not None:
+            groups = stage4_groups
+        else:
+            groups = 2 if stage_channels[3] >= 512 else 1
         layer4 = self._make_layer(
             stage_channels[3], num_blocks[3], stride=2, deploy=deploy, groups=groups
         )

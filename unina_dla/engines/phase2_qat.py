@@ -15,7 +15,7 @@ from unina_dla.model.losses.distillation_losses import (
     SDFDistillationLoss,
 )
 from unina_dla.model.teacher_model import get_teacher_model
-from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.qat_utils import (
     enable_calibration,
     enable_quantization,
@@ -111,7 +111,11 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
 
     nc_data = data_cfg.get("nc", 4)
     ckpt = torch.load(distill_ckpt, map_location=device, weights_only=False)
-    state_dict = ckpt["model"] if "model" in ckpt else ckpt
+    state_dict = (
+        ckpt.get("ema", ckpt["model"])
+        if "ema" in ckpt
+        else (ckpt["model"] if "model" in ckpt else ckpt)
+    )
     _validate_dual_head_state_dict(state_dict, distill_ckpt)
 
     # Profiling filter
@@ -121,16 +125,17 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
 
     is_fused = any("rbr_reparam" in k for k in state_dict.keys())
     arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
+    up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
 
     if is_fused:
-        print(f"[QAT] Detected FUSED checkpoint (Gen-{arch_version}). Creating fused arch...")
-        student = UNINA_DLA(num_classes=nc_data, deploy=True, version=arch_version).to(device)
+        print(f"[QAT] Detected FUSED checkpoint (Gen-{arch_version}, upsample={up_mode}). Creating fused arch...")
+        student = UNINA_DLA(num_classes=nc_data, deploy=True, version=arch_version, upsample_mode=up_mode).to(device)
         student.load_state_dict(state_dict, strict=True)
     else:
-        print(f"[QAT] Detected UNFUSED checkpoint (Gen-{arch_version}). Fusing now...")
+        print(f"[QAT] Detected UNFUSED checkpoint (Gen-{arch_version}, upsample={up_mode}). Fusing now...")
         # 1. Load as multi-branch first
         # We must load into deploy=False first because the weights match that structure
-        student_temp = UNINA_DLA(num_classes=nc_data, deploy=False, version=arch_version).to(device)
+        student_temp = UNINA_DLA(num_classes=nc_data, deploy=False, version=arch_version, upsample_mode=up_mode).to(device)
         student_temp.load_state_dict(state_dict, strict=False)
 
         # 2. Fuse (Switch to deploy)
@@ -366,15 +371,18 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
 
     # Resume Logic for QAT
     start_epoch = 0
-    resume_target = getattr(args, "resume_qat", None) or args.resume
+    resume_target = getattr(args, "resume_qat", None)
     if resume_target and os.path.isfile(resume_target):
         print(f"Resuming QAT from {resume_target}")
         ckpt = torch.load(resume_target, map_location=device)
-        state_dict = ckpt["model"] if "model" in ckpt else ckpt
+        state_dict = (
+            ckpt.get("ema", ckpt["model"])
+            if "ema" in ckpt
+            else (ckpt["model"] if "model" in ckpt else ckpt)
+        )
         _validate_dual_head_state_dict(state_dict, resume_target)
 
-        if "model" in ckpt:
-            student.load_state_dict(ckpt["model"])
+        student.load_state_dict(state_dict, strict=False)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -400,15 +408,28 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
     # Final BN re-estimation on best checkpoint
     if best_ckpt and os.path.exists(best_ckpt):
         print(f"\n[QAT] Loading Best Checkpoint {best_ckpt} for BN Re-estimation...")
-        ckpt = torch.load(best_ckpt, map_location=device)
-        student.load_state_dict(ckpt["model"])
+        best_data = torch.load(best_ckpt, map_location=device, weights_only=False)
+        state_dict = (
+            best_data.get("ema", best_data["model"])
+            if "ema" in best_data
+            else (best_data["model"] if "model" in best_data else best_data)
+        )
+        _validate_dual_head_state_dict(state_dict, best_ckpt)
+        student.load_state_dict(state_dict, strict=False)
 
         # Reuse calib_loader (kept non-shuffled for rectangular-shape safety)
-        bn_reestimate(student, calib_loader, device, num_batches=getattr(args, "bn_batches", 200))
+        bn_batches = getattr(args, "bn_batches", 200)
+        if bn_batches > 0:
+            try:
+                bn_reestimate(student, calib_loader, device, num_batches=bn_batches)
+            except Exception as e:
+                print(f"[Warning] Post-QAT BN re-estimation failed: {e}")
 
         # Update checkpoint
-        ckpt["model"] = student.state_dict()
-        torch.save(ckpt, best_ckpt)
+        best_data["model"] = student.state_dict()
+        if "ema" in best_data:
+            best_data["ema"] = student.state_dict()
+        torch.save(best_data, best_ckpt)
         print("[QAT] Best checkpoint updated with re-estimated BN stats.")
 
     return best_ckpt

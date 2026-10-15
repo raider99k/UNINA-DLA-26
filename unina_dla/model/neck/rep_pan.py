@@ -66,10 +66,14 @@ class RepPAN(nn.Module):
         out_channels=[256, 192, 128],
         deploy=False,
         spatial_fusion=True,
+        p5_groups=None,
+        upsample_mode="nearest",
     ):
         super(RepPAN, self).__init__()
         self.deploy = deploy
         self.spatial_fusion = spatial_fusion
+        self.p5_groups = p5_groups
+        self.upsample_mode = str(upsample_mode).lower() if upsample_mode is not None else "nearest"
 
         # P3, P4, P5 input channels from backbone
         c3, c4, c5 = in_channels
@@ -95,14 +99,26 @@ class RepPAN(nn.Module):
         # ============================================================
 
         # Reduce P5 to c5_out channels
-        p5_groups = 2 if (c5 >= 512 and c5 % 2 == 0) else 1
-        self.reduce_p5 = RepVGGBlock(c5, c5_out, groups=p5_groups, deploy=deploy)
+        # Gen 2.6 uses p5_groups=1 (hardware-verified CBUF residency: wtBanks=1, minDataBanks=2 <= 16)
+        # Gen 2.5 uses p5_groups=2 for legacy 1MB theoretical weight limit compliance
+        if p5_groups is not None:
+            eff_p5_groups = p5_groups
+        else:
+            eff_p5_groups = 2 if (c5 >= 512 and c5 % 2 == 0) else 1
+        self.reduce_p5 = RepVGGBlock(c5, c5_out, groups=eff_p5_groups, deploy=deploy)
 
         # Reduce P4 to c4_out channels
         self.reduce_p4 = RepVGGBlock(c4, c4_out, deploy=deploy)
 
         # Upsample P5 (c5_out channels) for concat with P4
-        self.upsample_p5 = DLAUpsample(c5_out)
+        # Gen 2.6 uses nn.Upsample(nearest) which runs natively on Orin DLA 2.0 with zero parameters
+        # Gen 2.5 and legacy models use DLAUpsample (ConvTranspose2d with bilinear kernel)
+        if self.upsample_mode == "nearest":
+            self.upsample_p5 = nn.Upsample(scale_factor=2, mode="nearest")
+        elif self.upsample_mode == "bilinear":
+            self.upsample_p5 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        else:
+            self.upsample_p5 = DLAUpsample(c5_out)
 
         # Fuse P4: concat(P4_reduced, P5_upsampled) → c4_out
         # Input: c4_out + c5_out, Output: c4_out
@@ -112,7 +128,12 @@ class RepPAN(nn.Module):
         self.reduce_p3 = RepVGGBlock(c3, c3_out, deploy=deploy)
 
         # Upsample P4_fused (c4_out channels) for concat with P3
-        self.upsample_p4 = DLAUpsample(c4_out)
+        if self.upsample_mode == "nearest":
+            self.upsample_p4 = nn.Upsample(scale_factor=2, mode="nearest")
+        elif self.upsample_mode == "bilinear":
+            self.upsample_p4 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+        else:
+            self.upsample_p4 = DLAUpsample(c4_out)
 
         # Fuse P3: concat(P3_reduced, P4_upsampled) → c3_out
         # Input: c3_out + c4_out, Output: c3_out

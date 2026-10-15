@@ -10,7 +10,7 @@ from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.data.utils import check_det_dataset
 from ultralytics.utils import DEFAULT_CFG, IterableSimpleNamespace
 
-from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.validator import validate
 
 
@@ -45,8 +45,15 @@ if __name__ == "__main__":
         "--version",
         type=str,
         default=None,
-        choices=["2.5", "3.1", "2", "3"],
+        choices=["2.6", "2.5", "3.1", "2", "3"],
         help="Architecture generation (default: auto-detected from checkpoint)",
+    )
+    parser.add_argument(
+        "--upsample_mode",
+        type=str,
+        default=None,
+        choices=["nearest", "deconv", "bilinear"],
+        help="Upsampling mode in Rep-PAN neck (default: auto-detected from checkpoint)",
     )
     args = parser.parse_args()
 
@@ -76,6 +83,7 @@ if __name__ == "__main__":
         state_dict = ckpt
 
     arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
+    up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
     is_fused = any("rbr_reparam" in k for k in state_dict.keys())
     is_qat_ckpt = args.qat
 
@@ -87,8 +95,8 @@ if __name__ == "__main__":
                 is_qat_ckpt = True
                 break
 
-    model = UNINA_DLA(num_classes=nc, deploy=is_fused, version=arch_version).to(device)
-    print(f"Initialized UNINA_DLA (nc={nc}, Gen-{arch_version}, deploy={is_fused}).")
+    model = UNINA_DLA(num_classes=nc, deploy=is_fused, version=arch_version, upsample_mode=up_mode).to(device)
+    print(f"Initialized UNINA_DLA (nc={nc}, Gen-{arch_version}, upsample={up_mode}, deploy={is_fused}).")
 
     if is_qat_ckpt:
         try:

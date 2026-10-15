@@ -54,6 +54,21 @@ if __name__ == "__main__":
         help="Skip strict DLA ONNX verification after export",
     )
 
+    parser.add_argument(
+        "--version",
+        type=str,
+        default=None,
+        choices=["2.6", "2.5", "3.1", "2", "3"],
+        help="Architecture generation (default: auto-detected from checkpoint)",
+    )
+    parser.add_argument(
+        "--upsample_mode",
+        type=str,
+        default=None,
+        choices=["nearest", "deconv", "bilinear"],
+        help="Upsampling mode in Rep-PAN neck (default: auto-detected from checkpoint)",
+    )
+
     args = parser.parse_args()
 
     # Parse image size (supports both square and rectangular)

@@ -250,3 +250,221 @@ def fuse_conv_bn_recursive(model):
     model.eval()
     _fuse_recursive(model)
     return fused_count
+
+
+REPVGG_A1_DEFAULT_URL = (
+    "https://huggingface.co/timm/repvgg_a1.rvgg_in1k/resolve/main/pytorch_model.bin"
+)
+
+
+def load_pretrained_backbone(
+    model: nn.Module,
+    weights_path_or_url: Union[str, bool] = "repvgg_a1",
+    device: Optional[Union[str, torch.device]] = None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Load ImageNet-pretrained RepVGG-A1 weights into the RepVGG backbone of UNINA-DLA.
+
+    Compatibility across Generations:
+    - Gen 2.6 (Hardware-Verified Champion, blocks [2, 4, 14, 1]):
+        Stages 0 to 4 (Stem, P2, P3, P4, P5) match RepVGG-A1 layer-for-layer (100% backbone coverage).
+        Stage 4 (512 channels, groups=1) is initialized by slicing the first 512 filters from
+        RepVGG-A1 Stage 4 (1280 channels), providing complete pretrained initialization.
+    - Gen 2.5 (Legacy Champion, blocks [2, 4, 14, 1]):
+        Stages 0 to 3 (Stem, P2, P3, P4) match RepVGG-A1 layer-for-layer (93.8% parameters loaded).
+        Stage 4 (P5, 512 channels, groups=2) is a custom DLA hardware adaptation to guarantee
+        on-chip CBUF SRAM residency (< 1 MiB) and is initialized with Kaiming Normal.
+    - Gen 3.1 (Spatial Neck Experiment, blocks [2, 4, 14, 1]):
+        Stages 0 to 3 match RepVGG-A1 layer-for-layer (90.8% parameters loaded).
+    - Gen 3 (blocks [2, 6, 8, 2]):
+        Stem, Stage 1, first 4 blocks of Stage 2, and first 8 blocks of Stage 3 match (76.3% parameters loaded).
+
+    Args:
+        model: UNINA-DLA detector or RepVGGBackbone instance.
+        weights_path_or_url: Path to .pth/.bin checkpoint file, URL, or 'repvgg_a1' for auto-download.
+        device: Device to place loaded tensors on.
+        verbose: If True, prints a detailed summary of loaded parameters.
+
+    Returns:
+        Dictionary with loading diagnostics ('loaded_params', 'total_params', 'coverage_pct', 'loaded_tensors').
+    """
+    import os
+    import re
+
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    weights_src = str(weights_path_or_url).strip()
+
+    # Resolve source path / URL
+    if weights_src.lower() in ("true", "1", "repvgg_a1", "a1", "default", "none"):
+        weights_url = REPVGG_A1_DEFAULT_URL
+        if verbose:
+            print(f"[Pretrained Backbone] Auto-fetching official RepVGG-A1 ImageNet weights from:\n  {weights_url}")
+        state_dict = torch.hub.load_state_dict_from_url(weights_url, map_location=dev, progress=verbose)
+    elif weights_src.startswith(("http://", "https://")):
+        if verbose:
+            print(f"[Pretrained Backbone] Fetching weights from URL:\n  {weights_src}")
+        state_dict = torch.hub.load_state_dict_from_url(weights_src, map_location=dev, progress=verbose)
+    else:
+        if not os.path.isfile(weights_src):
+            raise FileNotFoundError(f"[Pretrained Backbone] Checkpoint file not found: {weights_src}")
+        if verbose:
+            print(f"[Pretrained Backbone] Loading local checkpoint:\n  {weights_src}")
+        ckpt = torch.load(weights_src, map_location=dev, weights_only=False)
+        state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    # Extract target backbone module
+    backbone = getattr(model, "backbone", model)
+    target_sd = backbone.state_dict()
+    total_backbone_elements = sum(p.numel() for p in target_sd.values())
+
+    def _translate_key(src_k: str) -> Optional[str]:
+        # Strip common container prefixes
+        k = src_k
+        for prefix in ("model.", "backbone.", "module."):
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+
+        # Normalize branch names across implementations:
+        # timm uses conv_kxk / conv_1x1 / identity, while RepVGG uses rbr_dense / rbr_1x1 / rbr_identity
+        k = k.replace(".conv_kxk.", ".rbr_dense.")
+        k = k.replace(".conv_1x1.", ".rbr_1x1.")
+        k = k.replace(".identity.", ".rbr_identity.")
+
+        # 1. timm / holocron key format: features.X.Y.branches...
+        if k.startswith("features."):
+            parts = k.split(".")
+            if len(parts) >= 4 and parts[1].isdigit() and parts[2].isdigit():
+                stg = int(parts[1])
+                blk = int(parts[2])
+                rest = ".".join(parts[3:])
+                rest = rest.replace("branches.0.0.", "rbr_dense.conv.")
+                rest = rest.replace("branches.0.1.", "rbr_dense.bn.")
+                rest = rest.replace("branches.1.0.", "rbr_1x1.conv.")
+                rest = rest.replace("branches.1.1.", "rbr_1x1.bn.")
+                rest = rest.replace("branches.2.", "rbr_identity.")
+                if stg == 0:
+                    return f"stem.{rest}"
+                else:
+                    return f"stages.{stg - 1}.{blk}.{rest}"
+
+        # 2. DingXiaoH official format: stage0. / stage1.X. / stage2.X.
+        if k.startswith("stage0."):
+            return "stem." + k[len("stage0."):]
+        m_stage = re.match(r"^stage([1-4])\.(.+)", k)
+        if m_stage:
+            stage_idx = int(m_stage.group(1)) - 1  # stage1 -> stages.0
+            return f"stages.{stage_idx}.{m_stage.group(2)}"
+
+        # 3. Direct UNINA-DLA or timm-native format (stem. or stages.)
+        if k.startswith(("stem.", "stages.")):
+            return k
+
+        return None
+
+    loaded_params = 0
+    skipped_params = 0
+    loaded_tensors = 0
+    skipped_tensors = 0
+
+    with torch.no_grad():
+        for src_k, src_tensor in state_dict.items():
+            tgt_k = _translate_key(src_k)
+            if tgt_k is not None and tgt_k in target_sd:
+                tgt_tensor = target_sd[tgt_k]
+                if tgt_tensor.shape == src_tensor.shape:
+                    tgt_tensor.copy_(src_tensor.to(device=tgt_tensor.device, dtype=tgt_tensor.dtype))
+                    loaded_params += src_tensor.numel()
+                    loaded_tensors += 1
+                elif (
+                    tgt_tensor.ndim >= 1
+                    and src_tensor.ndim == tgt_tensor.ndim
+                    and tgt_tensor.shape[0] < src_tensor.shape[0]
+                    and tgt_tensor.shape[1:] == src_tensor.shape[1:]
+                ):
+                    # Slicing support for Stage 4 when channels=512 and groups=1 (Gen 2.6):
+                    # Official RepVGG-A1 Stage 4 has 1280 channels -> slice first 512 channels
+                    tgt_tensor.copy_(
+                        src_tensor[: tgt_tensor.shape[0]].to(device=tgt_tensor.device, dtype=tgt_tensor.dtype)
+                    )
+                    loaded_params += tgt_tensor.numel()
+                    loaded_tensors += 1
+                else:
+                    skipped_params += src_tensor.numel()
+                    skipped_tensors += 1
+
+    coverage_pct = min(100.0, (loaded_params / max(total_backbone_elements, 1)) * 100.0)
+
+    if verbose:
+        print(f"[Pretrained Backbone] Successfully initialized {loaded_tensors} tensors "
+              f"({loaded_params:,} / {total_backbone_elements:,} params/buffers - {coverage_pct:.2f}% coverage).")
+        if coverage_pct > 99.0:
+            print("[Pretrained Backbone] Complete 100% backbone pretraining achieved across Stages 0 to 4 (Gen 2.6).")
+        else:
+            print("[Pretrained Backbone] Note: Stages 0 to 3 match RepVGG-A1 ImageNet weights. "
+                  "Stage 4 (custom 512-ch / groups=2 DLA SRAM layout) and neck/heads remain randomly initialized.")
+
+    return {
+        "loaded_params": loaded_params,
+        "total_params": total_backbone_elements,
+        "coverage_pct": coverage_pct,
+        "loaded_tensors": loaded_tensors,
+        "skipped_tensors": skipped_tensors,
+    }
+
+
+def load_warm_start_weights(
+    model: nn.Module,
+    weights_path: str,
+    device: Optional[Union[str, torch.device]] = None,
+    verbose: bool = True,
+) -> dict:
+    """
+    Load weights from an existing UNINA-DLA checkpoint into the model with shape-tolerant matching.
+    Copies all parameters where names and shapes match. Mismatched shapes (e.g. from groups=2 to groups=1)
+    and missing layers (e.g. dropped deconv layers when switching to nn.Upsample) are skipped cleanly.
+    """
+    import os
+
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if not os.path.isfile(weights_path):
+        raise FileNotFoundError(f"[Warm Start] Checkpoint not found: {weights_path}")
+
+    ckpt = torch.load(weights_path, map_location=dev, weights_only=False)
+    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    target_sd = model.state_dict()
+    total_model_params = sum(p.numel() for p in model.parameters())
+
+    loaded_params = 0
+    loaded_tensors = 0
+    skipped_tensors = 0
+
+    with torch.no_grad():
+        for k, src_tensor in state_dict.items():
+            if k in target_sd:
+                tgt_tensor = target_sd[k]
+                if tgt_tensor.shape == src_tensor.shape:
+                    tgt_tensor.copy_(src_tensor.to(device=tgt_tensor.device, dtype=tgt_tensor.dtype))
+                    loaded_params += src_tensor.numel()
+                    loaded_tensors += 1
+                else:
+                    skipped_tensors += 1
+            else:
+                skipped_tensors += 1
+
+    pct = (loaded_params / max(total_model_params, 1)) * 100.0
+    if verbose:
+        print(f"[Warm Start] Loaded {loaded_tensors} tensors ({loaded_params:,} / {total_model_params:,} params - {pct:.2f}% coverage) from {weights_path}.")
+        if skipped_tensors > 0:
+            print(f"[Warm Start] Skipped {skipped_tensors} incompatible/unused tensors (e.g. legacy deconv weights or mismatched group convs).")
+
+    return {
+        "loaded_params": loaded_params,
+        "total_params": total_model_params,
+        "coverage_pct": pct,
+        "loaded_tensors": loaded_tensors,
+        "skipped_tensors": skipped_tensors,
+    }
+
+

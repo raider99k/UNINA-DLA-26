@@ -12,9 +12,9 @@ By using structurally re-parameterized convolutions (RepVGG), a memory-bounded p
 
 ## Architecture Overview
 
-- **Backbone**: RepVGG-B0. Employs a multi-branch topology during training that mathematically folds into single-path $3 \times 3$ convolutions and ReLUs for inference.
+- **Backbone**: RepVGG-A1 (adapted). Employs a multi-branch topology during training that mathematically folds into single-path $3 \times 3$ convolutions and ReLUs for inference. Follows the RepVGG-A1 `[2, 4, 14, 1]` layout with Stage 4 at 512 channels. In **Gen 2.6**, standard un-grouped convolutions (`groups=1`) are utilized throughout, providing 100% ImageNet pretraining coverage across all 4 stages while requiring only 3 out of 16 DLA CBUF SRAM banks. (Gen 2.5 legacy used `groups=2`).
 - **Activation Functions**: Uniform ReLU. Executes in 1 cycle on DLA Single Data Point (SDP) hardware, avoiding FP16 precision drops.
-- **Neck**: Rep-PAN with Small-Object Detection (SOD) priority channel sizing (`[256, 192, 128]` in the default Gen 2.5 configuration). Uses grouped convolutions on $P_5$ to guarantee on-chip Convolution Buffer (CBUF) SRAM residency (< 1 MiB) and deconvolutional upsampling (`DLAUpsample`).
+- **Neck**: Rep-PAN with Small-Object Detection (SOD) priority channel sizing (`[256, 192, 128]`). Uses standard convolutions (`groups=1` in Gen 2.6) with deconvolutional upsampling (`DLAUpsample`).
 - **Detection Head**: Decoupled dual-head during training (O2O target head + scheduled auxiliary O2M head). Direct coordinate regression outputs 4 linear box offsets, removing Non-Maximum Suppression (NMS), Softmax, and Distribution Focal Loss (DFL).
 - **Deployment Output**: Exports a 6-tensor output tuple `(reg3, reg4, reg5, cls3, cls4, cls5)` with class Sigmoids applied, directly consumable by zero-copy C++ TensorRT decoders.
 - **Model Compression**: 2:4 Structured Sparsity and Quantization-Aware Training (INT8 QAT) with sensitive prediction heads preserved in FP16.
@@ -29,11 +29,18 @@ Evaluated on the Formula Student Objects in Context (FSOCO) validation split (1,
 
 | Model | Target / Precision | Size (MB) | mAP50 | Latency (RTX 6000) | Throughput (RTX 6000) | Latency (Tesla T4) | Throughput (Tesla T4) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **UNINA-QAT (Gen 2.5)** | TensorRT INT8 | **19.8** | **80.7%** | **0.47 ms** | **1,359.8 FPS** | **2.77 ms** | **266.2 FPS** |
-| **UNINA-Sparse (Gen 2.5)** | TensorRT FP16 | 31.8 | 80.5% | 0.54 ms | 1,252.2 FPS | 4.18 ms | 193.6 FPS |
-| **YOLO26N-Engine** | TensorRT FP16 | 11.9 | 87.1% | 0.91 ms | 940.8 FPS | 3.35 ms | 247.1 FPS |
-| **YOLO26S-Engine** | TensorRT FP16 | 38.9 | 90.8% | 1.33 ms | 674.0 FPS | 8.08 ms | 113.9 FPS |
-| **YOLO26X-Engine** | TensorRT FP16 | 215.4 | 93.6% | 4.62 ms | 209.4 FPS | 48.07 ms | 20.5 FPS |
+| **UNINA-QAT (Gen 2.6 Champion)** | TensorRT INT8 | **25.1** | **84.3%** | **0.46 ms** | **1,378.0 FPS** | - | - |
+| **UNINA-Sparse (Gen 2.6 Champion)** | TensorRT FP16 | **38.0** | **88.2%** | **0.55 ms** | **1,223.9 FPS** | - | - |
+| **UNINA-QAT (Gen 2.5 Pretrained)** | TensorRT INT8 | **22.1** | **83.1%** | **0.51 ms** | **1,294.3 FPS** | **2.77 ms** | **266.2 FPS** |
+| **UNINA-Sparse (Gen 2.5 Pretrained)** | TensorRT FP16 | 36.4 | 81.6% | 0.56 ms | 1,225.7 FPS | 4.18 ms | 193.6 FPS |
+| **UNINA-QAT (Gen 2.5 Scratch)** | TensorRT INT8 | 22.1 | 80.7% | 0.51 ms | 1,294.3 FPS | 2.77 ms | 266.2 FPS |
+| **UNINA-QAT (Gen 1 Prototype)** | TensorRT INT8 | 19.8 | 80.7% | 0.47 ms | 1,359.8 FPS | - | - |
+| **YOLO26N-Engine** | TensorRT FP16 | 11.8 | 87.0% | 0.89 ms | 954.2 FPS | 3.35 ms | 247.1 FPS |
+| **YOLO26S-Engine** | TensorRT FP16 | 38.9 | 90.8% | 1.32 ms | 681.1 FPS | 8.08 ms | 113.9 FPS |
+| **YOLO26X-Engine** | TensorRT FP16 | 215.5 | 93.6% | 4.50 ms | 214.9 FPS | 48.07 ms | 20.5 FPS |
+
+> [!NOTE]
+> **Gen 2.6 Production Champion (150-Epoch Schedule)**: Combines 100% RepVGG-A1 pretraining across Stages 0–4 (`groups=1`) with transposed convolution upsampling, achieving **84.3% mAP50** (and **89.3% mAP50** at operational deployment threshold `conf=0.25`) at an ultra-fast **0.46 ms** inference latency (**1,378.0 FPS**), running 1.93x faster than YOLO26N-Engine while operating within only 3/16 DLA CBUF SRAM banks.
 
 For complete benchmark tables, per-class metrics, and execution profiles, see [**`docs/BENCHMARK_REPORT.md`**](docs/BENCHMARK_REPORT.md).
 
@@ -57,9 +64,10 @@ pip install -e .
 UNINA-DLA uses a 3-phase optimization pipeline:
 
 ```bash
-# Phase 1: Standalone Student Training (Generation 2.5 default)
+# Phase 1: Standalone Student Training (Generation 2.5 default, with optional RepVGG-A1 pretrained backbone)
 python scripts/train_student.py \
   --data configs/formula_student.yaml \
+  --pretrained_backbone repvgg_a1 \
   --epochs 100 \
   --batch 16 \
   --lr 0.01

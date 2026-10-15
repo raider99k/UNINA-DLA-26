@@ -5,7 +5,7 @@ import subprocess
 
 import torch
 
-from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.model_utils import fuse_conv_bn_recursive
 from unina_dla.utils.qat_utils import prepare_qat_model
 
@@ -213,13 +213,14 @@ def run_export(args):
         quant_nn.TensorQuantizer.use_fb_fake_quant = True
 
         arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
+        up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
 
         if is_fused_checkpoint:
-            print(f"[Export] Detected FUSED QAT checkpoint (Gen-{arch_version}). Initializing fused architecture...")
-            base_model = UNINA_DLA(num_classes=num_classes, deploy=True, version=arch_version).to(device)
+            print(f"[Export] Detected FUSED QAT checkpoint (Gen-{arch_version}, upsample={up_mode}). Initializing fused architecture...")
+            base_model = UNINA_DLA(num_classes=num_classes, deploy=True, version=arch_version, upsample_mode=up_mode).to(device)
         else:
-            print(f"[Export] Detected UNFUSED QAT checkpoint (Gen-{arch_version}). Initializing unfused architecture...")
-            base_model = UNINA_DLA(num_classes=num_classes, deploy=False, version=arch_version).to(device)
+            print(f"[Export] Detected UNFUSED QAT checkpoint (Gen-{arch_version}, upsample={up_mode}). Initializing unfused architecture...")
+            base_model = UNINA_DLA(num_classes=num_classes, deploy=False, version=arch_version, upsample_mode=up_mode).to(device)
 
         export_model = prepare_qat_model(
             base_model, verification_input_size=(1, 3, args.imgsz_hw[0], args.imgsz_hw[1])
@@ -238,17 +239,19 @@ def run_export(args):
                 export_model.head.deploy = True
     elif clean_qat_deploy:
         arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
-        print(f"[Export] Mode: Clean Deploy from QAT checkpoint (QDQ stripped, Gen-{arch_version})")
-        export_model = UNINA_DLA(num_classes=num_classes, deploy=is_fused_checkpoint, version=arch_version).to(device)
+        up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
+        print(f"[Export] Mode: Clean Deploy from QAT checkpoint (QDQ stripped, Gen-{arch_version}, upsample={up_mode})")
+        export_model = UNINA_DLA(num_classes=num_classes, deploy=is_fused_checkpoint, version=arch_version, upsample_mode=up_mode).to(device)
     else:
         arch_version = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
-        print(f"[Export] Mode: Standard FP32/FP16 (Fused RepVGG, Gen-{arch_version})")
+        up_mode = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
+        print(f"[Export] Mode: Standard FP32/FP16 (Fused RepVGG, Gen-{arch_version}, upsample={up_mode})")
         if is_fused_checkpoint:
             print(f"[Export] Detected FUSED checkpoint (Gen-{arch_version}). Initializing fused deploy architecture...")
-            export_model = UNINA_DLA(num_classes=num_classes, deploy=True, version=arch_version).to(device)
+            export_model = UNINA_DLA(num_classes=num_classes, deploy=True, version=arch_version, upsample_mode=up_mode).to(device)
         else:
             print(f"[Export] Detected UNFUSED checkpoint (Gen-{arch_version}). Initializing multi-branch architecture for weight loading...")
-            export_model = UNINA_DLA(num_classes=num_classes, deploy=False, version=arch_version).to(device)
+            export_model = UNINA_DLA(num_classes=num_classes, deploy=False, version=arch_version, upsample_mode=up_mode).to(device)
 
     # 4. Load Weights
     # Strict=False allows missing aux buffers in non-QAT or vice versa

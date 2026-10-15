@@ -237,6 +237,15 @@ def verify_dla_onnx(
                 result.deconv_violations.append(
                     f"ConvTranspose {node.name}: kernel_shape={kernel_shape} outside DLA-supported range [1, 32]"
                 )
+        elif node.op_type == "Resize":
+            mode = "nearest"
+            for attr in node.attribute:
+                if attr.name == "mode":
+                    mode = attr.s.decode("utf-8") if isinstance(attr.s, bytes) else str(attr.s)
+            if mode not in ["nearest", "linear"]:
+                result.warnings.append(
+                    f"Resize {node.name}: mode='{mode}' may trigger GPU fallback on DLA (recommended: 'nearest')"
+                )
 
     result.total_nodes = len(model.graph.node)
     result.op_counts = dict(op_counts)

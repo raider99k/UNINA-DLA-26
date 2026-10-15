@@ -24,6 +24,12 @@ from unina_dla.engines.phase2_qat import run_qat
 from unina_dla.engines.phase3_export import run_export
 
 
+def calculate_finetune_epochs(base_epochs: int, pct: float = 0.10) -> int:
+    """Proportional epoch scheduling for fine-tuning phases with min 1, max 30 guards."""
+    raw_pct = int(base_epochs * pct)
+    return max(1, min(raw_pct, 30))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="UNINA-DLA Training Pipeline: Distillation -> Sparsity -> QAT -> Export"
@@ -47,6 +53,12 @@ def main():
         default=None,
         help="[DEPRECATED] Image size (h w) for rectangular training. Use --imgsz instead.",
     )
+    parser.add_argument(
+        "--formula_image",
+        action="store_true",
+        default=False,
+        help="Activate static rectangular tensor padding strictly to --imgsz_hw (e.g. 480x768) with dataset shuffling enabled across epochs",
+    )
     parser.add_argument("--batch", type=int, default=16, help="Batch size")
     parser.add_argument("--workers", type=int, default=8, help="Num workers")
     parser.add_argument("--device", type=str, default="0", help="Device (0, cpu)")
@@ -55,13 +67,44 @@ def main():
         "--version",
         type=str,
         default=None,
-        choices=["2.5", "3.1", "2", "3"],
+        choices=["2.6", "2.5", "3.1", "2", "3"],
         help="Architecture generation (defaults to 2.5 for fresh training, or auto-detected from checkpoint)",
+    )
+    parser.add_argument(
+        "--upsample_mode",
+        type=str,
+        default=None,
+        choices=["nearest", "deconv", "bilinear"],
+        help="Upsampling mode in Rep-PAN neck (defaults to architecture preset, e.g. nearest for 2.6, deconv for 2.5)",
     )
 
     # Phase 1: Distillation
     parser.add_argument("--epochs", type=int, default=150, help="Phase 1 Epochs")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning Rate")
+    parser.add_argument(
+        "--warmup_epochs",
+        type=int,
+        default=None,
+        help="Phase 1 linear warmup epochs (defaults to 3, capped by total epochs; set 0 to disable)",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Learning Rate (defaults to 0.01 for MuSGD/SGD, 0.001 for AdamW)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="MuSGD",
+        choices=["MuSGD", "musgd", "AdamW", "adamw", "SGD", "sgd"],
+        help="Phase 1 optimizer: MuSGD (default), AdamW, or SGD",
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=None,
+        help="Weight decay (defaults to 1e-4 for AdamW, 1e-5 for MuSGD)",
+    )
     parser.add_argument(
         "--enable_distillation", action="store_true", help="Enable Knowledge Distillation"
     )
@@ -74,6 +117,26 @@ def main():
         help='Run in "Classic" Mode (Baseline training, no Distillation, no fancy loss)',
     )
     parser.add_argument("--resume", type=str, default=None, help="Resume Phase 1 from checkpoint")
+    parser.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="Initial checkpoint to warm-start student weights (shape-tolerant matching)",
+    )
+    parser.add_argument(
+        "--pretrained_backbone",
+        type=str,
+        default=None,
+        nargs="?",
+        const="repvgg_a1",
+        help="Initialize RepVGG backbone with ImageNet pretrained weights (e.g. --pretrained_backbone, --pretrained_backbone repvgg_a1, or path to checkpoint). Default: None (train from scratch).",
+    )
+    parser.add_argument(
+        "--backbone_lr_ratio",
+        type=float,
+        default=1.0,
+        help="Learning rate ratio for the backbone relative to base --lr (e.g. 0.1 for 10x lower backbone LR). Defaults to 1.0 (uniform full rate; empirical testing shows uniform LR outperforms 0.1x differential LR).",
+    )
 
     # Fade Schedule (Teacher Fade)
     parser.add_argument(
@@ -124,8 +187,8 @@ def main():
     parser.add_argument(
         "--o2m_aux_weight_end_distill",
         type=float,
-        default=0.0,
-        help="Aux O2M task weight at distillation phase end",
+        default=None,
+        help="Aux O2M task weight at distillation phase end (defaults to --o2m_aux_weight_end or 0.0)",
     )
     parser.add_argument(
         "--o2m_aux_weight_sparse_qat",
@@ -299,10 +362,13 @@ def main():
         "--epochs_sparsity",
         type=int,
         default=None,
-        help="Sparsity Fine-tuning Epochs (Default: 20%% of Phase 1, clipped [1, 30])",
+        help="Sparsity Fine-tuning Epochs (Default: 10%% of Phase 1, clipped [1, 30])",
     )
     parser.add_argument(
         "--skip_sparsity", action="store_true", help="Skip Sparsity Phase (if resuming QAT)"
+    )
+    parser.add_argument(
+        "--resume_sparsity", type=str, default=None, help="Resume Sparsity from checkpoint"
     )
     parser.add_argument("--bn_batches", type=int, default=200, help="Batches for BN Re-estimation")
 
@@ -312,7 +378,7 @@ def main():
         "--epochs_qat",
         type=int,
         default=None,
-        help="QAT Epochs (Default: 10%% of Phase 1, clipped [1, 30])",
+        help="QAT Epochs (Default: 5%% of Phase 1, clipped [1, 30])",
     )
     parser.add_argument("--resume_qat", type=str, default=None, help="Resume QAT from checkpoint")
     parser.add_argument("--calib_batches", type=int, default=200, help="QAT Calibration Batches")
@@ -354,10 +420,24 @@ def main():
     )
 
     args = parser.parse_args()
+    args._o2m_aux_weight_end_distill_explicit = args.o2m_aux_weight_end_distill is not None
 
     if args.kd_mech_all:
         args.kd_mech_cross_head = True
         args.kd_mech_global_rel = True
+
+    if args.optimizer is None:
+        args.optimizer = "MuSGD"
+    args.optimizer = str(args.optimizer).strip()
+
+    if args.lr is None:
+        args.lr = 0.001 if args.optimizer.lower() == "adamw" else 0.01
+
+    if args.weight_decay is None:
+        args.weight_decay = 1e-4 if args.optimizer.lower() == "adamw" else 1e-5
+
+    if args.backbone_lr_ratio is None:
+        args.backbone_lr_ratio = 1.0
 
     # Hardware
     if torch.cuda.is_available() and args.device != "cpu":
@@ -391,20 +471,19 @@ def main():
     # Proportional epoch scheduling for fine-tuning phases
     # If user doesn't specify epochs, calculate dynamically based on Phase 1 length
 
-    def calculate_finetune_epochs(base_epochs, pct=0.10):
-        raw_pct = int(base_epochs * pct)
-        # Guard Rails: Min 1, Max 30
-        return max(1, min(raw_pct, 30))
-
     if args.epochs_sparsity is None:
-        args.epochs_sparsity = calculate_finetune_epochs(args.epochs, pct=0.20)
+        args.epochs_sparsity = calculate_finetune_epochs(args.epochs, pct=0.10)
         print(
-            f"[Dynamic Epochs] Sparsity set to {args.epochs_sparsity} epochs (20% of {args.epochs})"
+            f"[Dynamic Epochs] Sparsity set to {args.epochs_sparsity} epochs (10% of {args.epochs})"
         )
+    else:
+        args.epochs_sparsity = max(1, int(args.epochs_sparsity))
 
     if args.epochs_qat is None:
-        args.epochs_qat = calculate_finetune_epochs(args.epochs, pct=0.10)
-        print(f"[Dynamic Epochs] QAT set to {args.epochs_qat} epochs (10% of {args.epochs})")
+        args.epochs_qat = calculate_finetune_epochs(args.epochs, pct=0.05)
+        print(f"[Dynamic Epochs] QAT set to {args.epochs_qat} epochs (5% of {args.epochs})")
+    else:
+        args.epochs_qat = max(1, int(args.epochs_qat))
 
     def validate_dual_head_checkpoint(path):
         ckpt_local = torch.load(path, map_location="cpu")
@@ -511,6 +590,19 @@ def main():
 
     # Pass 'rect=True' for rectangular training if aspect ratio is non-square
     is_rect = args.imgsz_hw[0] != args.imgsz_hw[1]
+    use_formula = getattr(args, "formula_image", False)
+    rect_train = True if use_formula else is_rect
+    rect_val = True if use_formula else is_rect
+    shuffle_mode = True if use_formula else not is_rect
+
+    if use_formula:
+        print(
+            f"[Info] Formula-Image static rectangular training enabled: Canvas fixed to {args.imgsz_hw[0]}x{args.imgsz_hw[1]} with shuffle=True."
+        )
+    elif is_rect:
+        print(
+            "[Info] Rectangular training enabled: Disabling shuffle to maintain batch aspect ratios."
+        )
 
     # Build Train Loader
     train_set = build_yolo_dataset(
@@ -519,15 +611,12 @@ def main():
         batch=args.batch,
         data=data_cfg_dict,
         mode="train",
-        rect=is_rect,
+        rect=rect_train,
         stride=32,
     )
-    # When rect=True, shuffle must be False to preserve aspect-ratio batching
-    shuffle_mode = not is_rect
-    if is_rect:
-        print(
-            "[Info] Rectangular training enabled: Disabling shuffle to maintain batch aspect ratios."
-        )
+    if use_formula and hasattr(train_set, "batch_shapes"):
+        train_set.batch_shapes[:] = [args.imgsz_hw[0], args.imgsz_hw[1]]
+
     train_loader = build_dataloader(
         train_set, batch=args.batch, workers=args.workers, shuffle=shuffle_mode
     )
@@ -539,9 +628,12 @@ def main():
         batch=args.batch,
         data=data_cfg_dict,
         mode="val",
-        rect=is_rect,
+        rect=rect_val,
         stride=32,
     )
+    if use_formula and hasattr(val_set, "batch_shapes"):
+        val_set.batch_shapes[:] = [args.imgsz_hw[0], args.imgsz_hw[1]]
+
     val_loader = build_dataloader(val_set, batch=args.batch, workers=args.workers, shuffle=False)
 
     def _advance_tb_offsets(active_loader, phase_epochs):
@@ -609,8 +701,9 @@ def main():
         elif checkpoint_has_sparsity:
             print("Checkpoint already has sparsity enabled. Skipping Phase 1.5.")
         else:
+            initial_sparse_ckpt = args.resume_sparsity if args.resume_sparsity else phase1_ckpt
             sparse_ckpt = run_sparsity_finetune(
-                args, device, data_cfg_dict, train_loader, val_loader, phase1_ckpt, writer
+                args, device, data_cfg_dict, train_loader, val_loader, initial_sparse_ckpt, writer
             )
             sparse_ran = True
 
@@ -653,9 +746,12 @@ def main():
             batch=args.batch,
             data=data_cfg_dict,
             mode="train",
-            rect=is_rect,
+            rect=rect_train,
             stride=32,
         )
+        if use_formula and hasattr(qat_train_set, "batch_shapes"):
+            qat_train_set.batch_shapes[:] = [args.imgsz_hw[0], args.imgsz_hw[1]]
+
         # Reassign to train_loader so run_qat uses the new one
         train_loader = build_dataloader(
             qat_train_set, batch=args.batch, workers=args.workers, shuffle=shuffle_mode
@@ -702,9 +798,12 @@ def main():
                 batch=args.batch,
                 data=data_cfg_dict,
                 mode="val",
-                rect=is_rect,
+                rect=rect_val,
                 stride=32,
             )
+            if use_formula and hasattr(test_set, "batch_shapes"):
+                test_set.batch_shapes[:] = [args.imgsz_hw[0], args.imgsz_hw[1]]
+
             test_loader = build_dataloader(
                 test_set, batch=args.batch, workers=args.workers, shuffle=False
             )
@@ -723,17 +822,26 @@ def main():
             print(f"Loading best checkpoint for testing: {final_ckpt}")
 
             # Re-init model
-            from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+            from unina_dla.model.unina_dla import (
+                UNINA_DLA,
+                detect_architecture_version,
+                detect_upsample_mode,
+            )
 
             num_classes = data_cfg_dict.get("nc", 4)
 
             # Detect architecture from checkpoint
             ckpt = torch.load(final_ckpt, map_location=device)
-            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            state_dict = (
+                ckpt.get("ema", ckpt["model"])
+                if "ema" in ckpt
+                else (ckpt["model"] if "model" in ckpt else ckpt)
+            )
             is_fused = any("rbr_reparam" in k for k in state_dict.keys())
             detected_ver = getattr(args, "version", None) or detect_architecture_version(state_dict) or "2.5"
+            detected_up = getattr(args, "upsample_mode", None) or detect_upsample_mode(state_dict)
 
-            test_model = UNINA_DLA(num_classes=num_classes, deploy=is_fused, version=detected_ver).to(device)
+            test_model = UNINA_DLA(num_classes=num_classes, deploy=is_fused, version=detected_ver, upsample_mode=detected_up).to(device)
 
             # Reconstruct QAT modules before loading checkpoint to preserve quantizer state.
             if args.enable_qat:

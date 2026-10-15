@@ -61,7 +61,7 @@ class UnifiedTrainer:
         self.is_sparse = False
         self.zero_clamp = None
         self.zero_grad_clamp = None
-        self.use_amp = args.amp and device.type == "cuda"
+        self.use_amp = bool(getattr(args, "amp", False)) and getattr(device, "type", str(device)) == "cuda"
 
         # History
         self.best_map = 0.0
@@ -133,7 +133,7 @@ class UnifiedTrainer:
     def _get_phase_warmup_epochs(self, total_epochs):
         """
         Resolve warmup epochs by phase.
-        - distill/standalone/classic: up to 3 epochs, capped by phase length
+        - distill/standalone/classic: up to 3 epochs (or CLI --warmup_epochs), capped by phase length
         - sparse/qat: <=3 -> 0, 4..10 -> 1, >=11 -> 2
         """
         total_epochs = max(int(total_epochs), 0)
@@ -145,7 +145,9 @@ class UnifiedTrainer:
             if total_epochs <= 10:
                 return 1
             return 2
-        return min(3, total_epochs)
+        cfg_warmup = getattr(self.args, "warmup_epochs", None)
+        default_warmup = 3 if cfg_warmup is None else max(int(cfg_warmup), 0)
+        return min(default_warmup, total_epochs)
 
     def _is_final_epoch(self, epoch, total_epochs):
         """True when current epoch is the last epoch of the active phase."""
@@ -173,6 +175,9 @@ class UnifiedTrainer:
         # Phase-aware warmup
         total_epochs = self._get_phase_total_epochs()
         warmup_epochs = self._get_phase_warmup_epochs(total_epochs)
+        if warmup_epochs <= 0:
+            return
+
         if epoch < warmup_epochs:
             # Linear warmup per-step
             total_warmup_steps = warmup_epochs * len_loader
@@ -187,6 +192,13 @@ class UnifiedTrainer:
                 if "initial_lr" not in param_group:
                     param_group["initial_lr"] = param_group["lr"]
                 param_group["lr"] = param_group["initial_lr"] * warmup_factor
+        elif epoch == warmup_epochs and i == 0:
+            # Cleanly restore full rate on the first step of post-warmup training
+            for param_group in self.optimizer.param_groups:
+                if param_group.get("is_balancer", False):
+                    continue
+                if "initial_lr" in param_group:
+                    param_group["lr"] = param_group["initial_lr"]
 
     def _log_batch_metrics(
         self,
@@ -773,10 +785,15 @@ class UnifiedTrainer:
             return float(getattr(self.args, "o2m_aux_weight_sparse_qat", 0.0))
         start_w = getattr(self.args, "o2m_aux_weight_start", 0.8)
         end_w = getattr(self.args, "o2m_aux_weight_end", 0.0)
-        # Distillation-specific default: fade O2M aux fully out by phase end.
-        # This reduces persistent O2M pressure that can block strict O2O behavior.
-        if self.teacher_wrapper:
-            end_w = getattr(self.args, "o2m_aux_weight_end_distill", end_w)
+        # Distillation-specific end weight:
+        # If user explicitly set o2m_aux_weight_end (non-zero), respect it unless
+        # o2m_aux_weight_end_distill was explicitly set by the user.
+        distill_end = getattr(self.args, "o2m_aux_weight_end_distill", None)
+        if self.teacher_wrapper and distill_end is not None:
+            if end_w != 0.0 and distill_end == 0.0 and not getattr(self.args, "_o2m_aux_weight_end_distill_explicit", False):
+                pass
+            else:
+                end_w = distill_end
         return float(
             calculate_component_weight(
                 epoch,

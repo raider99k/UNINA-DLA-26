@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from unina_dla.benchmark.config import ModelSpec
-from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version
+from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.box_ops import decode_bboxes, non_max_suppression
 from unina_dla.utils.metrics import UNINAMetrics
 from unina_dla.utils.model_utils import model_summary
@@ -387,9 +387,15 @@ class UNINAPyTorchAdapter(BaseModelAdapter):
         # Detect if checkpoint has structurally fused RepVGG blocks
         is_fused = any("rbr_reparam" in k for k in state_dict.keys())
 
-        # Build architecture: auto-detect generation from state_dict (defaults to 2.5 champion)
+        # Build architecture: auto-detect generation and upsample mode from state_dict
         detected_version = detect_architecture_version(state_dict)
-        model = UNINA_DLA(num_classes=self.num_classes, deploy=is_fused, version=detected_version)
+        detected_upsample = detect_upsample_mode(state_dict)
+        model = UNINA_DLA(
+            num_classes=self.num_classes,
+            deploy=is_fused,
+            version=detected_version,
+            upsample_mode=detected_upsample,
+        )
 
         if is_qat:
             try:
@@ -954,6 +960,12 @@ class TensorRTAdapter(BaseModelAdapter):
         if self.trt_stream:
             # Sync torch current stream with trt_stream
             torch.cuda.current_stream(self.device).wait_stream(self.trt_stream)
+
+        # Map outputs to canonical UNINA 6-tensor order if matching names are found
+        out_dict = {name: out for name, out in self._trt_outputs}
+        canonical_6 = ["reg3", "reg4", "reg5", "cls3", "cls4", "cls5"]
+        if all(k in out_dict for k in canonical_6):
+            return tuple(out_dict[k] for k in canonical_6)
 
         return tuple(out for _, out in self._trt_outputs)
 
