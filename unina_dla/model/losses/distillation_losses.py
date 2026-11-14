@@ -115,31 +115,38 @@ class SDFDistillationLoss(nn.Module):
         self.global_rel_weight = max(float(global_rel_weight), 0.0)
         self.global_rel_max_tokens = max(int(global_rel_max_tokens), 1)
 
-    def generate_attention_mask(self, teacher_feats):
+    def generate_attention_mask(self, teacher_feats, fg_masks=None):
         """
-        Generate spatial attention mask from teacher feature activation magnitudes.
+        Generate spatial attention mask from teacher feature activation magnitudes,
+        with optional GT/O2O foreground injection (Blind Teacher Fix) to ensure
+        small cones receive full distillation attention even if teacher activations are weak.
 
         Args:
             teacher_feats: list of [B, C, H, W] teacher feature tensors
+            fg_masks: optional list of [B, 1, H, W] foreground masks from O2O/GT assigner
 
         Returns:
             List of [B, 1, H, W] attention masks
         """
         masks = []
-        for feat in teacher_feats:
-            # Per-sample magnitude attention normalized to [0, 1]
+        for idx, feat in enumerate(teacher_feats):
+            # Per-sample magnitude attention normalized to [0, 1] (strictly 4D [B, 1, H, W])
             magnitude = torch.mean(torch.abs(feat), dim=1, keepdim=True)  # [B, 1, H, W]
-            m_max = magnitude.flatten(2).max(dim=-1, keepdim=True).values  # [B, 1]
-            m_max = m_max.unsqueeze(-1).unsqueeze(-1)  # [B, 1, 1, 1] broadcastable
+            m_max = magnitude.amax(dim=(2, 3), keepdim=True)  # [B, 1, 1, 1]
             norm_mag = magnitude / (m_max + 1e-5)
 
             if self.mask_type == "hard":
-                # Hard binary mask
                 mask = (norm_mag > self.threshold).float()
-                masks.append(mask)
             else:
-                # Soft mask (default)
-                masks.append(norm_mag)
+                mask = norm_mag
+
+            if fg_masks is not None and idx < len(fg_masks) and fg_masks[idx] is not None:
+                fg = fg_masks[idx].to(device=mask.device, dtype=mask.dtype)
+                if fg.shape[-2:] != mask.shape[-2:]:
+                    fg = F.interpolate(fg, size=mask.shape[-2:], mode="nearest")
+                mask = torch.maximum(mask, fg.clamp(0.0, 1.0))
+
+            masks.append(mask)
 
         return masks
 
@@ -187,7 +194,13 @@ class SDFDistillationLoss(nn.Module):
         return 0.5 * (loss_channel_rel + loss_spatial_rel)
 
     def forward(
-        self, student_feats, teacher_feats, adapters, attention_mask=None, return_breakdown=False
+        self,
+        student_feats,
+        teacher_feats,
+        adapters,
+        attention_mask=None,
+        fg_masks=None,
+        return_breakdown=False,
     ):
         """
         Args:
@@ -195,6 +208,7 @@ class SDFDistillationLoss(nn.Module):
             teacher_feats: list of teacher feature maps [P3, P4, P5]
             adapters: ModuleList of 1x1 convs to match STUDENT channels to TEACHER
             attention_mask: Optional list of pre-calculated [B, 1, H, W] masks.
+            fg_masks: Optional list of [B, 1, H, W] foreground masks for GT/O2O injection.
             return_breakdown: If True, return (total_loss, breakdown_dict) for diagnostics.
         """
         loss = 0.0
@@ -207,7 +221,7 @@ class SDFDistillationLoss(nn.Module):
         if attention_mask is not None:
             masks = attention_mask
         else:
-            masks = self.generate_attention_mask(teacher_feats)
+            masks = self.generate_attention_mask(teacher_feats, fg_masks=fg_masks)
 
         for i, (s_feat, t_feat, adapter, mask) in enumerate(
             zip(student_feats, teacher_feats, adapters, masks)
@@ -443,20 +457,22 @@ class OneToOneBoxLoss(nn.Module):
     def bbox_iou_ltrb(self, box1, box2, eps=1e-5):
         """
         Calculate IoU between two sets of LTRB boxes.
-        box1, box2: [N, 4] (l, t, r, b) distances from grid center.
+        box1, box2: [N, 4] (l, t, r, b) signed distances from grid center.
+        Supports negative individual offsets for sub-stride objects while clamping total width/height >= 0.
         """
-        # Clamp to ensure non-negative distances
-        box1 = box1.clamp(min=0)
-        box2 = box2.clamp(min=0)
-
-        # Intersection width = min(l1, l2) + min(r1, r2)
-        # Intersection height = min(t1, t2) + min(b1, b2)
-        inter_w = (torch.min(box1[:, 0], box2[:, 0]) + torch.min(box1[:, 2], box2[:, 2])).clamp(0)
-        inter_h = (torch.min(box1[:, 1], box2[:, 1]) + torch.min(box1[:, 3], box2[:, 3])).clamp(0)
+        # Anchor is at origin (0, 0): x1 = -l, y1 = -t, x2 = r, y2 = b
+        # Intersection width = min(x2_1, x2_2) - max(x1_1, x1_2) = min(r1, r2) + min(l1, l2)
+        inter_w = (torch.min(box1[:, 0], box2[:, 0]) + torch.min(box1[:, 2], box2[:, 2])).clamp(min=0.0)
+        inter_h = (torch.min(box1[:, 1], box2[:, 1]) + torch.min(box1[:, 3], box2[:, 3])).clamp(min=0.0)
         inter_area = inter_w * inter_h
 
-        area1 = (box1[:, 0] + box1[:, 2]) * (box1[:, 1] + box1[:, 3])
-        area2 = (box2[:, 0] + box2[:, 2]) * (box2[:, 1] + box2[:, 3])
+        w1 = (box1[:, 0] + box1[:, 2]).clamp(min=0.0)
+        h1 = (box1[:, 1] + box1[:, 3]).clamp(min=0.0)
+        w2 = (box2[:, 0] + box2[:, 2]).clamp(min=0.0)
+        h2 = (box2[:, 1] + box2[:, 3]).clamp(min=0.0)
+
+        area1 = w1 * h1
+        area2 = w2 * h2
 
         union = area1 + area2 - inter_area + eps
 
@@ -468,7 +484,7 @@ class OneToOneBoxLoss(nn.Module):
         Wise-IoU v3 for LTRB format boxes.
 
         Adapted from box_ops.wise_iou but specifically for LTRB (distance from anchor) format.
-        Uses the class's running mean IoU for dynamic v3 focusing.
+        Supports signed individual LTRB offsets for sub-stride cones.
 
         Args:
             pred: [N, 4] (l, t, r, b) student predictions
@@ -478,22 +494,20 @@ class OneToOneBoxLoss(nn.Module):
             iou: Standard IoU [N]
             l_wiou: Wise-IoU v3 loss [N]
         """
-        pred = pred.clamp(min=0)
-        target = target.clamp(min=0)
-
-        # Standard IoU for LTRB
+        # Standard IoU for LTRB (supports signed individual offsets with non-negative total w, h)
         iou = self.bbox_iou_ltrb(pred, target)
 
         # Distance Penalty (R_WIoU)
-        # For LTRB, "center offset" = difference in left-right and top-bottom balances
-        pred_cx = (pred[:, 2] - pred[:, 0]) / 2  # Horizontal center offset
-        pred_cy = (pred[:, 3] - pred[:, 1]) / 2  # Vertical center offset
-        target_cx = (target[:, 2] - target[:, 0]) / 2
-        target_cy = (target[:, 3] - target[:, 1]) / 2
+        # Anchor-relative centers: cx = (x1 + x2)/2 = (r - l)/2, cy = (y1 + y2)/2 = (b - t)/2
+        pred_cx = (pred[:, 2] - pred[:, 0]) * 0.5
+        pred_cy = (pred[:, 3] - pred[:, 1]) * 0.5
+        target_cx = (target[:, 2] - target[:, 0]) * 0.5
+        target_cy = (target[:, 3] - target[:, 1]) * 0.5
 
-        # Enclosing box dimensions
-        box_w = torch.max(pred[:, 0] + pred[:, 2], target[:, 0] + target[:, 2]).clamp(min=1e-7)
-        box_h = torch.max(pred[:, 1] + pred[:, 3], target[:, 1] + target[:, 3]).clamp(min=1e-7)
+        # Smallest enclosing box dimensions in anchor-relative coordinates:
+        # enc_w = max(r_p, r_t) - min(-l_p, -l_t) = max(r_p, r_t) + max(l_p, l_t)
+        box_w = (torch.max(pred[:, 0], target[:, 0]) + torch.max(pred[:, 2], target[:, 2])).clamp(min=1e-7)
+        box_h = (torch.max(pred[:, 1], target[:, 1]) + torch.max(pred[:, 3], target[:, 3])).clamp(min=1e-7)
 
         # Distance and diagonal (denominator detached per WIoU paper to prevent gradient leak)
         dist2 = (pred_cx - target_cx) ** 2 + (pred_cy - target_cy) ** 2
@@ -700,7 +714,7 @@ class AdaptiveLossBalancer(nn.Module):
         """
         # Indices 0, 1, 2 are SDF, Logit, Box distillation losses
         # Apply same clamp as forward() for consistency
-        clamped = self.log_vars[:3].clamp(min=-2.0, max=2.0)
+        clamped = self.log_vars[:3].clamp(min=-1.5, max=1.5)
         return torch.exp(-clamped)
 
     def soft_reset(self, target_max_weight: float = 5.0):

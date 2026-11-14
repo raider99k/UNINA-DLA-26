@@ -111,7 +111,7 @@ if __name__ == "__main__":
     model.load_state_dict(state_dict, strict=False)
 
     if is_qat_ckpt:
-        enable_quantization(model)
+        enable_quantization(model, device=device)
 
     # Build validation dataset and dataloader (matching train_student.py pattern)
     dataset_cfg = IterableSimpleNamespace(**DEFAULT_CFG.__dict__)

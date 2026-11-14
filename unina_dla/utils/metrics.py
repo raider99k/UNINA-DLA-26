@@ -124,6 +124,8 @@ class UNINAMetrics:
                     matches = matches[iou_np[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                     # Unique by pred index (keep first = highest IoU)
                     matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+                    # Re-sort by IoU (descending) because np.unique orders by pred_idx ascending
+                    matches = matches[iou_np[matches[:, 0], matches[:, 1]].argsort()[::-1]]
                     # Unique by GT index (keep first = highest IoU)
                     matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
 

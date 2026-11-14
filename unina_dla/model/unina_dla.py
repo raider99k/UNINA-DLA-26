@@ -9,12 +9,22 @@ from unina_dla.model.neck.rep_pan import RepPAN
 def detect_architecture_version(state_dict):
     """
     Auto-detect UNINA-DLA architecture generation from state_dict keys and tensor shapes.
-    - Gen 3 / 3.1: contains backbone.sppf or neck.p4_fusion.1 (spatial fusion RepVGG blocks)
+    - Gen 3.2: contains backbone.sppf or neck.p4_fusion.1, Stage 4 with 512 channels, deconv/nearest upsampling, unbounded reg
+    - Gen 3 / 3.1: contains backbone.sppf or neck.p4_fusion.1 (spatial fusion RepVGG blocks) with 256-ch Stage 4
     - Gen 2.6: contains stage 3 with 512 channels, neck channels [256, 192, 128], stage4 groups=1
     - Gen 2.5: contains stage 3 with 512 channels, neck channels [256, 192, 128], stage4 groups=2
     - Gen 2: neck channels [192, 192, 128]
     """
     if any("backbone.sppf" in k for k in state_dict.keys()) or any("p4_fusion.1" in k for k in state_dict.keys()):
+        # Check if Stage 4 has 512 channels -> Gen 3.2
+        for sk, sv in state_dict.items():
+            if getattr(sv, "ndim", 0) >= 2:
+                if ("stages.3.0" in sk and ("rbr_dense.conv.weight" in sk or "rbr_reparam.weight" in sk or sk.endswith("stages.3.0.weight"))) and sv.shape[0] == 512:
+                    return "3.2"
+                if "backbone.sppf.cv1" in sk and ("rbr_dense.conv.weight" in sk or "rbr_reparam.weight" in sk) and sv.shape[1] == 512:
+                    return "3.2"
+                if "neck.reduce_p5" in sk and ("rbr_dense.conv.weight" in sk or "rbr_reparam.weight" in sk) and sv.shape[1] == 512:
+                    return "3.2"
         # Distinguish Gen 3 (P4=8) from Gen 3.1 (P4=14)
         if any("stages.2.13" in k for k in state_dict.keys()):
             return "3.1"
@@ -69,6 +79,11 @@ class UNINA_DLA(nn.Module):
     - Output (deploy=True): 6-tensor tuple (reg3, reg4, reg5, cls3, cls4, cls5) for zero-copy TensorRT deployment.
 
     Generations:
+    - version="3.2" (DLA 2.0 SOTA Architecture):
+        Backbone [2, 4, 14, 1] + DLASPPF, widths (64, 128, 256, 512), groups=1 throughout.
+        Spatial 3x3 Rep-PAN neck with wide SOD channels [256, 192, 128] + learnable DLA deconv upsampling (compatible with nearest).
+        Unbounded direct LTRB regression in YOLO26Head (no hard ReLU clipping on sub-stride cones).
+        Full 100% ImageNet RepVGG-A1 pretraining coverage across all 4 stages with L1-norm filter selection.
     - version="2.6" (Hardware-Verified Champion):
         Backbone [2, 4, 14, 1], widths (64, 128, 256, 512), groups=1 throughout.
         Pointwise 1x1 Rep-PAN neck with wide SOD channels [256, 192, 128], reduce_p5 groups=1.
@@ -102,13 +117,24 @@ class UNINA_DLA(nn.Module):
         stage4_groups=None,
         p5_groups=None,
         upsample_mode=None,
+        reg_relu=None,
     ):
         super().__init__()
         self.deploy = deploy
         self.version = str(version) if version is not None else "2.5"
 
         # Architectural Presets by Generation
-        if self.version == "2.6":
+        if self.version == "3.2":
+            cfg_blocks = (2, 4, 14, 1)
+            cfg_channels = (64, 128, 256, 512)
+            cfg_sppf = True
+            cfg_spatial = True
+            cfg_neck = [256, 192, 128]
+            cfg_stage4_groups = 1
+            cfg_p5_groups = 1
+            cfg_upsample_mode = "deconv"
+            cfg_reg_relu = False
+        elif self.version == "2.6":
             cfg_blocks = (2, 4, 14, 1)
             cfg_channels = (64, 128, 256, 512)
             cfg_sppf = False
@@ -117,6 +143,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 1
             cfg_p5_groups = 1
             cfg_upsample_mode = "nearest"
+            cfg_reg_relu = True
         elif self.version == "2.5":
             cfg_blocks = (2, 4, 14, 1)
             cfg_channels = (64, 128, 256, 512)
@@ -126,6 +153,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 2
             cfg_p5_groups = 2
             cfg_upsample_mode = "deconv"
+            cfg_reg_relu = True
         elif self.version == "3.1":
             cfg_blocks = (2, 4, 14, 1)
             cfg_channels = (64, 128, 256, 256)
@@ -135,6 +163,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 1
             cfg_p5_groups = 1
             cfg_upsample_mode = "deconv"
+            cfg_reg_relu = True
         elif self.version == "3":
             cfg_blocks = (2, 6, 8, 2)
             cfg_channels = (64, 128, 256, 256)
@@ -144,6 +173,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 1
             cfg_p5_groups = 1
             cfg_upsample_mode = "deconv"
+            cfg_reg_relu = True
         elif self.version == "2":
             cfg_blocks = (2, 4, 14, 1)
             cfg_channels = (64, 128, 256, 512)
@@ -153,6 +183,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 2
             cfg_p5_groups = 2
             cfg_upsample_mode = "deconv"
+            cfg_reg_relu = True
         else:
             cfg_blocks = (2, 4, 14, 1)
             cfg_channels = (64, 128, 256, 512)
@@ -162,6 +193,7 @@ class UNINA_DLA(nn.Module):
             cfg_stage4_groups = 1
             cfg_p5_groups = 1
             cfg_upsample_mode = "nearest"
+            cfg_reg_relu = True
 
         # Explicit overrides take precedence if provided
         if backbone_blocks is not None:
@@ -180,8 +212,11 @@ class UNINA_DLA(nn.Module):
             cfg_p5_groups = p5_groups
         if upsample_mode is not None:
             cfg_upsample_mode = str(upsample_mode).lower()
+        if reg_relu is not None:
+            cfg_reg_relu = bool(reg_relu)
 
         self.upsample_mode = cfg_upsample_mode
+        self.reg_relu = cfg_reg_relu
 
         # Backbone
         self.backbone = RepVGGBackbone(
@@ -204,7 +239,12 @@ class UNINA_DLA(nn.Module):
         )
 
         # Head
-        self.head = YOLO26Head(num_classes=num_classes, in_channels=cfg_neck, deploy=deploy)
+        self.head = YOLO26Head(
+            num_classes=num_classes,
+            in_channels=cfg_neck,
+            deploy=deploy,
+            reg_relu=cfg_reg_relu,
+        )
 
     def forward(self, x):
         # Backbone

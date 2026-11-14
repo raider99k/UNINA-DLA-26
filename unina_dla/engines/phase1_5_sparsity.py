@@ -304,15 +304,32 @@ def run_sparsity_finetune(args, device, data_cfg, train_loader, val_loader, dist
             scaler.load_state_dict(ckpt["scaler"])
         if "ema" in ckpt and ema:
             ema.ema.load_state_dict(ckpt["ema"])
+        if "map" in ckpt:
+            trainer.best_map = ckpt["map"]
+        if "early_stopping" in ckpt:
+            trainer.load_early_stopping_state(ckpt["early_stopping"])
 
         print(f"Resumed from Epoch {start_epoch}")
     elif resume_target:
         print(f"[Warning] Resume file not found: {resume_target}")
 
-    best_ckpt = None
-    for epoch in range(start_epoch, args.epochs_sparsity):
-        trainer.train_epoch(epoch, train_loader, prefix="sparse")
-        best_ckpt = trainer.run_validation(val_loader, epoch, prefix="sparse")
+    best_ckpt = (
+        trainer.get_best_checkpoint_path()
+        if os.path.isfile(trainer.get_best_checkpoint_path())
+        else None
+    )
+    epochs_completed = 0
+    if not trainer.should_stop:
+        for epoch in range(start_epoch, args.epochs_sparsity):
+            trainer.train_epoch(epoch, train_loader, prefix="sparse")
+            best_ckpt = trainer.run_validation(val_loader, epoch, prefix="sparse")
+            epochs_completed += 1
+            if trainer.should_stop:
+                break
+    else:
+        print("[EarlyStopping] Resumed sparsity checkpoint already reached stopping criterion.")
+
+    args._phase_epochs_completed = epochs_completed
 
     # Verify Sparsity
     print("\n[Sparsity Verification]")

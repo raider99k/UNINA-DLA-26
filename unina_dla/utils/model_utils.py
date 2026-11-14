@@ -1,3 +1,4 @@
+import json
 from typing import Optional, Tuple, Union
 
 import torch
@@ -367,7 +368,39 @@ def load_pretrained_backbone(
     loaded_tensors = 0
     skipped_tensors = 0
 
+    translated_sd = {}
+    for src_k, src_tensor in state_dict.items():
+        tgt_k = _translate_key(src_k)
+        if tgt_k is not None:
+            translated_sd[tgt_k] = src_tensor
+
+    # Precompute consistent top-k channel indices by L1-norm importance for any stage block
+    # where pretrained output channels exceed target channels (e.g. Stage 4: 1280 -> 512 in Gen 2.6 / Gen 3.2).
+    channel_slice_indices = {}
     with torch.no_grad():
+        for tgt_k, src_tensor in translated_sd.items():
+            if tgt_k.endswith(".rbr_dense.conv.weight") and tgt_k in target_sd:
+                tgt_tensor = target_sd[tgt_k]
+                if (
+                    src_tensor.ndim == 4
+                    and tgt_tensor.ndim == 4
+                    and tgt_tensor.shape[0] < src_tensor.shape[0]
+                    and tgt_tensor.shape[1:] == src_tensor.shape[1:]
+                ):
+                    block_prefix = tgt_k[: -len("rbr_dense.conv.weight")]
+                    k_out = tgt_tensor.shape[0]
+                    # Compute L1 importance across (C_in, kH, kW)
+                    importance = src_tensor.detach().float().abs().mean(dim=(1, 2, 3))
+                    bn_w_key = block_prefix + "rbr_dense.bn.weight"
+                    bn_v_key = block_prefix + "rbr_dense.bn.running_var"
+                    if bn_w_key in translated_sd and bn_v_key in translated_sd:
+                        bn_w = translated_sd[bn_w_key].detach().float().abs()
+                        bn_v = translated_sd[bn_v_key].detach().float().clamp(min=0.0)
+                        if bn_w.shape[0] == importance.shape[0] and bn_v.shape[0] == importance.shape[0]:
+                            importance = importance * (bn_w / torch.sqrt(bn_v + 1e-5))
+                    top_idx = torch.topk(importance, k=k_out, largest=True).indices.sort().values
+                    channel_slice_indices[block_prefix] = top_idx
+
         for src_k, src_tensor in state_dict.items():
             tgt_k = _translate_key(src_k)
             if tgt_k is not None and tgt_k in target_sd:
@@ -382,11 +415,17 @@ def load_pretrained_backbone(
                     and tgt_tensor.shape[0] < src_tensor.shape[0]
                     and tgt_tensor.shape[1:] == src_tensor.shape[1:]
                 ):
-                    # Slicing support for Stage 4 when channels=512 and groups=1 (Gen 2.6):
-                    # Official RepVGG-A1 Stage 4 has 1280 channels -> slice first 512 channels
-                    tgt_tensor.copy_(
-                        src_tensor[: tgt_tensor.shape[0]].to(device=tgt_tensor.device, dtype=tgt_tensor.dtype)
-                    )
+                    # Importance-ranked channel selection for Stage 4 when channels=512 and groups=1 (Gen 2.6 / Gen 3.2)
+                    matched_idx = None
+                    for prefix, idx_tensor in channel_slice_indices.items():
+                        if tgt_k.startswith(prefix) and idx_tensor.numel() == tgt_tensor.shape[0]:
+                            matched_idx = idx_tensor.to(device=src_tensor.device)
+                            break
+                    if matched_idx is not None:
+                        sliced = src_tensor.index_select(0, matched_idx)
+                    else:
+                        sliced = src_tensor[: tgt_tensor.shape[0]]
+                    tgt_tensor.copy_(sliced.to(device=tgt_tensor.device, dtype=tgt_tensor.dtype))
                     loaded_params += tgt_tensor.numel()
                     loaded_tensors += 1
                 else:
@@ -398,8 +437,8 @@ def load_pretrained_backbone(
     if verbose:
         print(f"[Pretrained Backbone] Successfully initialized {loaded_tensors} tensors "
               f"({loaded_params:,} / {total_backbone_elements:,} params/buffers - {coverage_pct:.2f}% coverage).")
-        if coverage_pct > 99.0:
-            print("[Pretrained Backbone] Complete 100% backbone pretraining achieved across Stages 0 to 4 (Gen 2.6).")
+        if coverage_pct > 99.0 or len(channel_slice_indices) > 0:
+            print("[Pretrained Backbone] Complete Stages 0 to 4 RepVGG-A1 ImageNet pretraining loaded (L1-norm filter selection on Stage 4).")
         else:
             print("[Pretrained Backbone] Note: Stages 0 to 3 match RepVGG-A1 ImageNet weights. "
                   "Stage 4 (custom 512-ch / groups=2 DLA SRAM layout) and neck/heads remain randomly initialized.")
@@ -421,8 +460,9 @@ def load_warm_start_weights(
 ) -> dict:
     """
     Load weights from an existing UNINA-DLA checkpoint into the model with shape-tolerant matching.
-    Copies all parameters where names and shapes match. Mismatched shapes (e.g. from groups=2 to groups=1)
-    and missing layers (e.g. dropped deconv layers when switching to nn.Upsample) are skipped cleanly.
+    Prefers EMA weights if present in checkpoint. Copies all parameters where names and shapes match
+    (including cross-generation translation of 1x1 neck fusion blocks to spatial fusion block 0).
+    Mismatched shapes (e.g. from groups=2 to groups=1) and missing layers are skipped cleanly.
     """
     import os
 
@@ -431,7 +471,15 @@ def load_warm_start_weights(
         raise FileNotFoundError(f"[Warm Start] Checkpoint not found: {weights_path}")
 
     ckpt = torch.load(weights_path, map_location=dev, weights_only=False)
-    state_dict = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    if isinstance(ckpt, dict):
+        if "ema" in ckpt and isinstance(ckpt["ema"], dict) and len(ckpt["ema"]) > 0:
+            state_dict = ckpt["ema"]
+        elif "model" in ckpt and isinstance(ckpt["model"], dict):
+            state_dict = ckpt["model"]
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
 
     target_sd = model.state_dict()
     total_model_params = sum(p.numel() for p in model.parameters())
@@ -441,9 +489,20 @@ def load_warm_start_weights(
     skipped_tensors = 0
 
     with torch.no_grad():
-        for k, src_tensor in state_dict.items():
-            if k in target_sd:
-                tgt_tensor = target_sd[k]
+        for raw_k, src_tensor in state_dict.items():
+            k = raw_k.replace("_orig_mod.", "")
+            tgt_k = k if k in target_sd else None
+            if tgt_k is None and "_fusion.rbr_" in k:
+                k_alt = k.replace("_fusion.rbr_", "_fusion.0.rbr_")
+                if k_alt in target_sd:
+                    tgt_k = k_alt
+            elif tgt_k is None and "_fusion.0.rbr_" in k:
+                k_alt = k.replace("_fusion.0.rbr_", "_fusion.rbr_")
+                if k_alt in target_sd:
+                    tgt_k = k_alt
+
+            if tgt_k is not None:
+                tgt_tensor = target_sd[tgt_k]
                 if tgt_tensor.shape == src_tensor.shape:
                     tgt_tensor.copy_(src_tensor.to(device=tgt_tensor.device, dtype=tgt_tensor.dtype))
                     loaded_params += src_tensor.numel()
@@ -466,5 +525,22 @@ def load_warm_start_weights(
         "loaded_tensors": loaded_tensors,
         "skipped_tensors": skipped_tensors,
     }
+
+
+def strip_engine_metadata(raw: bytes) -> bytes:
+    """Strip Ultralytics' leading [4-byte little-endian len][JSON dict] prefix if present."""
+    if len(raw) < 8:
+        return raw
+    meta_len = int.from_bytes(raw[:4], byteorder="little", signed=True)
+    if meta_len <= 0 or (4 + meta_len) >= len(raw):
+        return raw
+    try:
+        meta = json.loads(raw[4 : 4 + meta_len].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    if not isinstance(meta, dict):
+        return raw
+    return raw[4 + meta_len :]
+
 
 

@@ -12,11 +12,11 @@ By using structurally re-parameterized convolutions (RepVGG), a memory-bounded p
 
 ## Architecture Overview
 
-- **Backbone**: RepVGG-A1 (adapted). Employs a multi-branch topology during training that mathematically folds into single-path $3 \times 3$ convolutions and ReLUs for inference. Follows the RepVGG-A1 `[2, 4, 14, 1]` layout with Stage 4 at 512 channels. In **Gen 2.6**, standard un-grouped convolutions (`groups=1`) are utilized throughout, providing 100% ImageNet pretraining coverage across all 4 stages while requiring only 3 out of 16 DLA CBUF SRAM banks. (Gen 2.5 legacy used `groups=2`).
-- **Activation Functions**: Uniform ReLU. Executes in 1 cycle on DLA Single Data Point (SDP) hardware, avoiding FP16 precision drops.
-- **Neck**: Rep-PAN with Small-Object Detection (SOD) priority channel sizing (`[256, 192, 128]`). Uses standard convolutions (`groups=1` in Gen 2.6) with deconvolutional upsampling (`DLAUpsample`).
-- **Detection Head**: Decoupled dual-head during training (O2O target head + scheduled auxiliary O2M head). Direct coordinate regression outputs 4 linear box offsets, removing Non-Maximum Suppression (NMS), Softmax, and Distribution Focal Loss (DFL).
-- **Deployment Output**: Exports a 6-tensor output tuple `(reg3, reg4, reg5, cls3, cls4, cls5)` with class Sigmoids applied, directly consumable by zero-copy C++ TensorRT decoders.
+- **Backbone (Gen 3.2 Default)**: RepVGG-A1 (adapted, `[2, 4, 14, 1]`, widths `(64, 128, 256, 512)`). Multi-branch training blocks fold mathematically into single-path $3 \times 3$ convolutions and ReLUs for inference. Standard un-grouped convolutions (`groups=1` throughout Stages 0–4) give 100% ImageNet pretraining coverage across all 4 stages while using only 3 out of 16 DLA CBUF SRAM banks in INT8. **Gen 3.2** adds **DLASPPF** on Stage 4 (`MaxPool2d(5)` pyramid pooling with a shared INT8 quantizer across concatenated branches for DLA compliance).
+- **Activation Functions**: Uniform ReLU across the feature extractor, executing in 1 cycle on DLA Single Data Point (SDP) hardware without FP16 LUT overhead.
+- **Neck**: Spatial Rep-PAN with Small-Object Detection (SOD) priority channel sizing (`[256, 192, 128]`). **Gen 3.2** upgrades the neck with paired $1 \times 1 \to 3 \times 3$ RepVGG spatial fusion blocks (`groups=1` on `reduce_p5`) and learnable ungrouped transposed convolution upsampling (**`DLAUpsample`**, `ConvTranspose2d`; zero-parameter `nearest` from Gen 2.6 remains supported).
+- **Detection Head**: Decoupled dual-head during training (O2O target head + dynamically scheduled auxiliary O2M head). Direct coordinate regression outputs 4 linear LTRB offsets without Non-Maximum Suppression (NMS), Softmax, or Distribution Focal Loss (DFL); **Gen 3.2** uses unbounded regression (`reg_relu=False`) to avoid clipping small/sub-stride box offsets.
+- **Deployment Output**: Exports a 6-tensor output tuple `(reg3, reg4, reg5, cls3, cls4, cls5)` with class Sigmoids applied (`~24.2M` fused parameters, `45.7 GFLOPs` at `480x768`), directly consumable by zero-copy C++ TensorRT decoders.
 - **Model Compression**: 2:4 Structured Sparsity and Quantization-Aware Training (INT8 QAT) with sensitive prediction heads preserved in FP16.
 
 For full architectural derivations, hardware proofs, and loss formulations, see [**`docs/ARCHITECTURE.md`**](docs/ARCHITECTURE.md).
@@ -27,10 +27,48 @@ For full architectural derivations, hardware proofs, and loss formulations, see 
 
 Evaluated on the Formula Student Objects in Context (FSOCO) validation split (1,157 images, input resolution $480 \times 768$, batch size 1):
 
+### Gen 3.2 RTX PRO 6000 TensorRT 10.16 (7-Model FP16 & INT8 Suite)
+
+Evaluated on **NVIDIA RTX PRO 6000 Blackwell Server Edition** (`480x768`, `batch=1`, 50 warmup, 200 iterations, TensorRT `10.16.1.11`, upgraded `ultralytics 8.4.x`, slim FP16 YOLO exports):
+
+| Model Name | Precision | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | E2E (ms) | FPS |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`UNINA-QAT-INT8`** | INT8 (QAT) | 26.8 | 0.873 | 0.622 | **0.57** | **0.88** | **1,140.0** |
+| **`UNINA-Sparse-FP16`** | FP16 (2:4) | 41.5 | 0.877 | 0.618 | 0.63 | 0.93 | 1,075.2 |
+| **`UNINA-Standalone-FP16`** | FP16 | 39.2 | 0.879 | **0.630** | 0.63 | 0.93 | 1,070.9 |
+| **`UNINA-QAT-FP16`** | FP16 | 41.9 | 0.875 | 0.620 | 0.62 | 0.95 | 1,055.5 |
+| `YOLO26N-FP16` | FP16 | 6.3 | 0.784 | 0.517 | 0.65 | 0.87 | 1,143.7 |
+| `YOLO26S-FP16` | FP16 | 20.0 | 0.838 | 0.575 | 0.78 | 1.00 | 1,000.9 |
+| `YOLO26X-FP16` | FP16 | 108.5 | **0.888** | 0.622 | 2.07 | 2.30 | 435.4 |
+
+> [!NOTE]
+> **Cross-Generation & Batch=1 Hardware Caveat**: Compared with the legacy Gen 2.6 table below, these Gen 3.2 runs reflect the heavier Gen 3.2 architecture (`DLASPPF` + spatial 3x3 Rep-PAN + `deconv` vs Gen 2.6 `21.9M` 1x1 Rep-PAN + `nearest`), **TensorRT `10.16.1.11`**, upgraded **`ultralytics 8.4.x`**, and slim `scripts/build_engine.py` FP16 YOLO engines (`6.3 / 20.0 / 108.5 MB` vs legacy FP32-sized `11.8 / 38.9 / 215.5 MB`), so **1:1 comparisons across historical runs are not exact**. At `batch=1` on Blackwell, `UNINA-Sparse-FP16` and `UNINA-Standalone-FP16` both hit ~`0.63 ms` inference latency because single-image execution is launch/memory-bandwidth bound rather than compute bound.
+
+### Gen 3.2 Tesla T4 TensorRT 10.16 (9-Model FP16 & INT8 Suite)
+
+Evaluated on **NVIDIA Tesla T4** (`480 x 768`, batch size 1, 50 warmup / 200 timed iterations):
+
+| Model | Target / Precision | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | E2E (ms) | Throughput (FPS) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **UNINA-QAT-INT8 (Gen 3.2)** | TensorRT INT8 (QAT) | **19.9** | **87.3%** | **62.2%** | **2.52** | **3.58** | **279.6** |
+| **UNINA-QAT-FP16 (Gen 3.2)** | TensorRT FP16 (Clean) | 38.5 | 87.5% | 62.0% | 4.25 | 5.34 | 187.4 |
+| **UNINA-Sparse-FP16 (Gen 3.2)** | TensorRT FP16 | 38.5 | **87.7%** | 61.8% | 4.26 | 5.30 | 188.8 |
+| **YOLO26N-FP16** | TensorRT FP16 | 6.8 | 78.7% | 52.2% | 1.78 | 2.66 | 376.1 |
+| **YOLO26N-INT8** | TensorRT INT8 (PTQ) | 5.9 | 76.6% | 49.6% | 1.70 | 2.62 | 382.0 |
+| **YOLO26S-FP16** | TensorRT FP16 | 20.4 | 84.1% | 58.2% | 2.75 | 3.64 | 275.0 |
+| **YOLO26S-INT8** | TensorRT INT8 (PTQ) | 13.0 | 70.6% | 45.3% | 1.91 | 2.79 | 358.7 |
+| **YOLO26X-FP16** | TensorRT FP16 | 108.8 | 89.3% | 63.0% | 12.84 | 13.76 | 72.7 |
+| **YOLO26X-INT8** | TensorRT INT8 (PTQ) | 60.6 | 83.8% | 52.5% | 7.50 | 8.45 | 118.4 |
+
+> [!IMPORTANT]
+> **Dependency & Environment Change Caveat**: The Gen 3.2 T4 suite above was built and evaluated under **TensorRT `10.16.1.11`**, an upgraded **`ultralytics 8.4.x`** release (which updated `compute_ap` PR-curve integration, lowering reported mAP at `conf=0.25` relative to `8.4.4`), and slim FP16 YOLO exports via `scripts/build_engine.py`. Because of these dependency and engine-build differences, **direct 1:1 comparisons against the historical Gen 2.6/2.5 numbers below may not be exact**—compare all 9 models within the same run above for a controlled apples-to-apples evaluation. Notably, QAT preserves virtually 100% of FP16 localization (`62.2%` vs `62.0%` mAP50-95) at 1.69x lower latency, whereas Ultralytics INT8 PTQ drops `YOLO26S` by `-13.5 pp` mAP50 (`-12.9 pp` mAP50-95) and `YOLO26X` by `-5.5 pp` mAP50 (`-10.5 pp` mAP50-95).
+
+### Historical Baselines (Gen 2.6 & Gen 2.5 — Legacy Dependencies)
+
 | Model | Target / Precision | Size (MB) | mAP50 | Latency (RTX 6000) | Throughput (RTX 6000) | Latency (Tesla T4) | Throughput (Tesla T4) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **UNINA-QAT (Gen 2.6 Champion)** | TensorRT INT8 | **25.1** | **84.3%** | **0.46 ms** | **1,378.0 FPS** | - | - |
-| **UNINA-Sparse (Gen 2.6 Champion)** | TensorRT FP16 | **38.0** | **88.2%** | **0.55 ms** | **1,223.9 FPS** | - | - |
+| **UNINA-QAT (Gen 2.6)** | TensorRT INT8 | **25.1** | **84.3%** | **0.46 ms** | **1,378.0 FPS** | - | - |
+| **UNINA-Sparse (Gen 2.6)** | TensorRT FP16 | **38.0** | **88.2%** | **0.55 ms** | **1,223.9 FPS** | - | - |
 | **UNINA-QAT (Gen 2.5 Pretrained)** | TensorRT INT8 | **22.1** | **83.1%** | **0.51 ms** | **1,294.3 FPS** | **2.77 ms** | **266.2 FPS** |
 | **UNINA-Sparse (Gen 2.5 Pretrained)** | TensorRT FP16 | 36.4 | 81.6% | 0.56 ms | 1,225.7 FPS | 4.18 ms | 193.6 FPS |
 | **UNINA-QAT (Gen 2.5 Scratch)** | TensorRT INT8 | 22.1 | 80.7% | 0.51 ms | 1,294.3 FPS | 2.77 ms | 266.2 FPS |
@@ -40,7 +78,7 @@ Evaluated on the Formula Student Objects in Context (FSOCO) validation split (1,
 | **YOLO26X-Engine** | TensorRT FP16 | 215.5 | 93.6% | 4.50 ms | 214.9 FPS | 48.07 ms | 20.5 FPS |
 
 > [!NOTE]
-> **Gen 2.6 Production Champion (150-Epoch Schedule)**: Combines 100% RepVGG-A1 pretraining across Stages 0–4 (`groups=1`) with transposed convolution upsampling, achieving **84.3% mAP50** (and **89.3% mAP50** at operational deployment threshold `conf=0.25`) at an ultra-fast **0.46 ms** inference latency (**1,378.0 FPS**), running 1.93x faster than YOLO26N-Engine while operating within only 3/16 DLA CBUF SRAM banks.
+> **Gen 2.6 (150-Epoch Schedule)**: Combines 100% RepVGG-A1 pretraining across Stages 0–4 (`groups=1`) with transposed convolution upsampling, achieving **84.3% mAP50** (and **89.3% mAP50** at operational deployment threshold `conf=0.25`) at **0.46 ms** inference latency (**1,378.0 FPS**), running 1.93x faster than YOLO26N-Engine while operating within 3/16 DLA CBUF SRAM banks.
 
 For complete benchmark tables, per-class metrics, and execution profiles, see [**`docs/BENCHMARK_REPORT.md`**](docs/BENCHMARK_REPORT.md).
 
@@ -64,7 +102,7 @@ pip install -e .
 UNINA-DLA uses a 3-phase optimization pipeline:
 
 ```bash
-# Phase 1: Standalone Student Training (Generation 2.5 default, with optional RepVGG-A1 pretrained backbone)
+# Phase 1: Standalone Student Training (Generation 3.2 default, with optional RepVGG-A1 pretrained backbone)
 python scripts/train_student.py \
   --data configs/formula_student.yaml \
   --pretrained_backbone repvgg_a1 \

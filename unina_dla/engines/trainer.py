@@ -5,7 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from unina_dla.utils.qat_utils import freeze_quantization_observers
+from unina_dla.utils.early_stopping import EarlyStopping, extract_monitor_score
+from unina_dla.utils.qat_utils import freeze_quantization_observers, update_weight_quantizers
 from unina_dla.utils.scheduling import (
     calculate_component_weight,
     calculate_task_weight,
@@ -62,6 +63,8 @@ class UnifiedTrainer:
         self.zero_clamp = None
         self.zero_grad_clamp = None
         self.use_amp = bool(getattr(args, "amp", False)) and getattr(device, "type", str(device)) == "cuda"
+        self.early_stopping = None
+        self.should_stop = False
 
         # History
         self.best_map = 0.0
@@ -108,6 +111,48 @@ class UnifiedTrainer:
         self.ema = ema
         if self.is_qat:
             self.use_amp = False  # Force off for QAT
+        self.configure_early_stopping()
+
+    def _resolve_early_stopping_config(self):
+        """Resolve phase-aware early stopping configuration from args."""
+        total_epochs = self._get_phase_total_epochs()
+        warmup_epochs = self._get_phase_warmup_epochs(total_epochs)
+        metric_name = str(getattr(self.args, "early_stop_metric", "mAP50") or "mAP50")
+        min_delta = float(getattr(self.args, "min_delta", 0.0) or 0.0)
+
+        if self.is_qat:
+            raw_patience = getattr(self.args, "patience_qat", None)
+            patience = 0 if raw_patience is None else int(raw_patience)
+            min_epochs = warmup_epochs
+        elif self.is_sparse:
+            raw_patience = getattr(self.args, "patience_sparsity", None)
+            patience = 0 if raw_patience is None else int(raw_patience)
+            min_epochs = warmup_epochs
+        else:
+            raw_patience = getattr(self.args, "patience", 0)
+            patience = 0 if raw_patience is None else int(raw_patience)
+            cfg_min = getattr(self.args, "early_stop_min_epochs", None)
+            min_epochs = warmup_epochs if cfg_min is None else max(0, int(cfg_min))
+
+        return patience, min_delta, min_epochs, metric_name
+
+    def configure_early_stopping(self):
+        """Initialize or reconfigure phase-aware EarlyStopping state."""
+        patience, min_delta, min_epochs, metric_name = self._resolve_early_stopping_config()
+        self.early_stopping = EarlyStopping(
+            patience=patience,
+            min_delta=min_delta,
+            min_epochs=min_epochs,
+            metric_name=metric_name,
+        )
+        self.should_stop = False
+
+    def load_early_stopping_state(self, state):
+        """Restore EarlyStopping state from a resumed checkpoint."""
+        if self.early_stopping is None:
+            self.configure_early_stopping()
+        self.early_stopping.load_state_dict(state)
+        self.should_stop = self.early_stopping.should_stop
 
     def _get_phase_name(self):
         """Resolve current training phase label for logs/scheduling."""
@@ -357,13 +402,54 @@ class UnifiedTrainer:
                 f"[Trainer] Phase={phase} | epochs={total_epochs} | warmup={warmup_epochs} | "
                 f"fade={fade_desc} | task={task_desc} | {curriculum_desc} | o2m_aux={o2m_aux_weight:.4f}"
             )
+            if self.early_stopping is None:
+                self.configure_early_stopping()
+            if self.early_stopping.enabled:
+                print(
+                    f"[EarlyStopping] Enabled for {phase}: metric={self.early_stopping.metric_name}, "
+                    f"patience={self.early_stopping.patience}, min_delta={self.early_stopping.min_delta:.4f}, "
+                    f"min_epochs={self.early_stopping.min_epochs}"
+                )
+                if not self.is_qat and not self.is_sparse and not getattr(self.args, "classic", False):
+                    stage2_pct = max(0.0, min(float(getattr(self.args, "o2o_topk_stage2_pct", 0.35)), 1.0))
+                    stage2_epoch = int(total_epochs * stage2_pct)
+                    if self.early_stopping.min_epochs < stage2_epoch:
+                        print(
+                            f"[EarlyStopping] Note: min_epochs ({self.early_stopping.min_epochs}) is below "
+                            f"O2O stage2 curriculum epoch (~{stage2_epoch}); pass --early_stop_min_epochs "
+                            "to defer early stopping until strict O2O begins."
+                        )
 
         if o2o_topk is not None:
             phase_epochs = max(self._get_phase_total_epochs(), 1)
             print(f"[Trainer] O2O curriculum: epoch {epoch + 1}/{phase_epochs}, topk={o2o_topk}")
 
+        # Close Mosaic/Mixup/CopyPaste in final close_mosaic epochs of Phase 1
+        if not self.is_qat and not self.is_sparse:
+            total_epochs = self._get_phase_total_epochs()
+            close_mosaic = int(getattr(self.args, "close_mosaic", 10) or 0)
+            if close_mosaic > 0 and total_epochs > close_mosaic and epoch >= (total_epochs - close_mosaic):
+                ds = getattr(loader, "dataset", None)
+                if ds is not None and not getattr(ds, "_unina_mosaic_closed", False):
+                    if hasattr(ds, "hyp") and ds.hyp is not None:
+                        ds.hyp.mosaic = 0.0
+                        ds.hyp.mixup = 0.0
+                        ds.hyp.copy_paste = 0.0
+                        if hasattr(ds, "close_mosaic") and callable(ds.close_mosaic):
+                            try:
+                                ds.close_mosaic(hyp=ds.hyp)
+                            except Exception:
+                                pass
+                    if hasattr(ds, "mosaic"):
+                        ds.mosaic = False
+                    ds._unina_mosaic_closed = True
+                    print(
+                        f"[Trainer] Closed Mosaic/Mixup/CopyPaste for final {total_epochs - epoch} epochs "
+                        f"(epoch {epoch + 1}/{total_epochs})."
+                    )
+
         # QAT specific: freeze observers late in training
-        if self.is_qat and epoch >= (self.args.epochs_qat - 2):
+        if self.is_qat and epoch >= max(1, self.args.epochs_qat - 2):
             freeze_quantization_observers(self.student)
 
         # Keep BatchNorm statistics frozen during QAT fine-tuning
@@ -613,9 +699,12 @@ class UnifiedTrainer:
 
                 self.optimizer.step()
 
-            # 6. Post-Step Hooks (Sparsity/EMA)
+            # 6. Post-Step Hooks (Sparsity/QAT/EMA)
             if self.zero_clamp:
                 self.zero_clamp()
+
+            if self.is_qat:
+                update_weight_quantizers(self.student)
 
             if self.ema:
                 self.ema.update(self.student)
@@ -1088,8 +1177,8 @@ class UnifiedTrainer:
                     _set_topk(topk_setter, prev_topk, prev_topk2)
                 self.task_loss_fn.loss_fn.train(prev_mode)
 
-        # SDF Loss
-        sdf_masks = self.distill_losses["sdf"].generate_attention_mask(t_feats)
+        # SDF Loss (with O2O foreground mask injection so weak teacher activations on small cones are never ignored)
+        sdf_masks = self.distill_losses["sdf"].generate_attention_mask(t_feats, fg_masks=t_o2o_masks)
         l_sdf, sdf_bd = self.distill_losses["sdf"](
             s_neck, t_feats, self.adapters, attention_mask=sdf_masks, return_breakdown=True
         )
@@ -1180,7 +1269,7 @@ class UnifiedTrainer:
         """Unified validation logic"""
         phase_total_epochs = self._get_phase_total_epochs()
         is_final_epoch = self._is_final_epoch(epoch, phase_total_epochs)
-        model_to_val = self.ema.ema if self.ema and not self.is_qat else self.student
+        model_to_val = self.ema.ema if self.ema else self.student
 
         # Unwrap torch.compile wrapper if present to configure deployment mode
         real_model = model_to_val
@@ -1215,15 +1304,55 @@ class UnifiedTrainer:
                 self.writer.add_scalar(f"{prefix}/mAP50", metrics["mAP50"], epoch_step)
             self.history["map"].append(metrics["mAP50"])
 
-            if metrics["mAP50"] > self.best_map:
+            is_new_best = metrics["mAP50"] > self.best_map
+            if is_new_best:
                 self.best_map = metrics["mAP50"]
+
+            if self.early_stopping is None:
+                self.configure_early_stopping()
+            if self.early_stopping.enabled:
+                es_score = extract_monitor_score(metrics, self.early_stopping.metric_name)
+                self.should_stop = self.early_stopping.step(epoch, es_score)
+                if self.writer:
+                    epoch_step = self._global_epoch(epoch)
+                    self.writer.add_scalar(
+                        f"{prefix}/EarlyStop_Counter", self.early_stopping.counter, epoch_step
+                    )
+                if self.should_stop:
+                    best_str = (
+                        f"{self.early_stopping.best_score:.4f}"
+                        if self.early_stopping.best_score is not None
+                        else "n/a"
+                    )
+                    print(
+                        f"[EarlyStopping] Stopping {self._get_phase_name()} early at epoch "
+                        f"{epoch + 1}/{phase_total_epochs}: {self.early_stopping.metric_name} "
+                        f"did not improve by > {self.early_stopping.min_delta:.4f} for "
+                        f"{self.early_stopping.patience} epochs "
+                        f"(best={best_str} at epoch "
+                        f"{self.early_stopping.best_epoch + 1})."
+                    )
+                elif self.early_stopping.counter > 0:
+                    best_str = (
+                        f"{self.early_stopping.best_score:.4f}"
+                        if self.early_stopping.best_score is not None
+                        else "n/a"
+                    )
+                    print(
+                        f"[EarlyStopping] No improvement in {self.early_stopping.metric_name} "
+                        f"({es_score:.4f} <= {best_str} + "
+                        f"{self.early_stopping.min_delta:.4f}): "
+                        f"{self.early_stopping.counter}/{self.early_stopping.patience}"
+                    )
+
+            if is_new_best:
                 self.save_checkpoint("best", epoch, metrics["mAP50"])
                 print(f"New Best Model (mAP50: {self.best_map:.4f})")
 
             self.save_checkpoint("last", epoch, metrics["mAP50"])
 
-            # COMPARATIVE VALIDATION (Every 5 epochs + Last)
-            compare_due = ((epoch + 1) % 5 == 0) or is_final_epoch
+            # COMPARATIVE VALIDATION (Every 5 epochs + Last + Early Stop)
+            compare_due = ((epoch + 1) % 5 == 0) or is_final_epoch or self.should_stop
             if compare_due:
                 print(f"\n[Validation] Running Comparative Analysis (Epoch {epoch + 1})...")
 
@@ -1371,6 +1500,8 @@ class UnifiedTrainer:
                 ckpt["task_loss_o2m"] = self.task_loss_fn.o2m_loss_fn.state_dict()
         if self.scaler:
             ckpt["scaler"] = self.scaler.state_dict()
+        if self.early_stopping is not None:
+            ckpt["early_stopping"] = self.early_stopping.state_dict()
 
         suffix = (
             "qat"

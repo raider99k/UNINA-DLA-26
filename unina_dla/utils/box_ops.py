@@ -79,11 +79,12 @@ def dist2bbox(distance, anchor_points, xywh=True, dim=-1):
     lt, rb = torch.split(distance, 2, dim)
     x1y1 = anchor_points - lt
     x2y2 = anchor_points + rb
+    c_xy = (x1y1 + x2y2) * 0.5
+    wh = (x2y2 - x1y1).clamp(min=0.0)
     if xywh:
-        c_xy = (x1y1 + x2y2) / 2
-        wh = x2y2 - x1y1
         return torch.cat((c_xy, wh), dim)
-    return torch.cat((x1y1, x2y2), dim)
+    half_wh = wh * 0.5
+    return torch.cat((c_xy - half_wh, c_xy + half_wh), dim)
 
 
 def decode_bboxes(dfl_preds, anchors, strides, xywh=False, dfl_weight=None):

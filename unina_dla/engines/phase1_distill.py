@@ -69,7 +69,17 @@ def run_distillation(args, device, data_cfg, train_loader, val_loader, writer):
     print(f"Dataset Class Count: {nc_data}")
 
     # Initialize Student
-    arch_version = getattr(args, "version", None) or "2.5"
+    arch_version = getattr(args, "version", None)
+    if arch_version is None and getattr(args, "resume", None) and os.path.isfile(args.resume):
+        try:
+            from unina_dla.model.unina_dla import detect_architecture_version
+
+            ckpt_probe = torch.load(args.resume, map_location="cpu", weights_only=False)
+            sd_probe = ckpt_probe.get("model", ckpt_probe) if isinstance(ckpt_probe, dict) else ckpt_probe
+            arch_version = detect_architecture_version(sd_probe)
+        except Exception:
+            arch_version = None
+    arch_version = arch_version or "3.2"
     up_mode = getattr(args, "upsample_mode", None)
     student = UNINA_DLA(num_classes=nc_data, deploy=False, version=arch_version, upsample_mode=up_mode).to(device)
     print(f"Student initialized with {nc_data} classes (YOLO26 Head, Gen-{arch_version}, upsample={student.upsample_mode}).")
@@ -183,7 +193,7 @@ def run_distillation(args, device, data_cfg, train_loader, val_loader, writer):
     # Optimizer selection (AdamW, SGD, or MuSGD)
     opt_name = str(getattr(args, "optimizer", "MuSGD")).strip().lower()
     base_lr = float(getattr(args, "lr", 0.001 if opt_name == "adamw" else 0.01))
-    weight_decay = float(getattr(args, "weight_decay", 1e-4 if opt_name == "adamw" else 1e-5))
+    weight_decay = float(getattr(args, "weight_decay", 1e-4 if opt_name == "adamw" else 5e-4))
     backbone_lr_ratio = float(getattr(args, "backbone_lr_ratio", 1.0))
 
     if opt_name == "adamw":
@@ -227,7 +237,7 @@ def run_distillation(args, device, data_cfg, train_loader, val_loader, writer):
             if hasattr(student.backbone, "stem"):
                 pretrained_params.extend(list(student.backbone.stem.parameters()))
             if hasattr(student.backbone, "stages"):
-                stage_limit = 4 if arch_version == "2.6" else 3
+                stage_limit = 4 if arch_version in ("2.6", "3.2") else 3
                 for stage in student.backbone.stages[:stage_limit]:
                     pretrained_params.extend(list(stage.parameters()))
 
@@ -276,8 +286,8 @@ def run_distillation(args, device, data_cfg, train_loader, val_loader, writer):
                     "weight_decay": 0.0,
                 },
             ]
-            stages_str = "Stem + Stages 1-4 (100% Backbone)" if arch_version == "2.6" else "Stem + Stages 1-3"
-            scratch_str = "Neck + Heads + Adapters" if arch_version == "2.6" else "Stage 4 + Neck + Heads + Adapters"
+            stages_str = "Stem + Stages 1-4 (100% Backbone)" if arch_version in ("2.6", "3.2") else "Stem + Stages 1-3"
+            scratch_str = "Neck + Heads + Adapters" if arch_version in ("2.6", "3.2") else "Stage 4 + Neck + Heads + Adapters"
             print(
                 f"[Optimizer] Surgical Differential LR enabled:\n"
                 f"  - Pretrained Stages ({stages_str}): LR = {base_lr * backbone_lr_ratio:.6f} ({backbone_lr_ratio:.2f}x ratio)\n"
@@ -402,13 +412,27 @@ def run_distillation(args, device, data_cfg, train_loader, val_loader, writer):
                     print(f"[Warning] Could not fully restore O2M task loss state: {e}")
             if "scaler" in ckpt:
                 scaler.load_state_dict(ckpt["scaler"])
+            if "early_stopping" in ckpt:
+                trainer.load_early_stopping_state(ckpt["early_stopping"])
             print(f"Resumed from Epoch {start_epoch}")
 
     # Loop
-    best_ckpt = None
-    for epoch in range(start_epoch, args.epochs):
-        trainer.train_epoch(epoch, train_loader, prefix="distill")
-        best_ckpt = trainer.run_validation(val_loader, epoch, prefix="distill")
+    best_ckpt = (
+        trainer.get_best_checkpoint_path()
+        if os.path.isfile(trainer.get_best_checkpoint_path())
+        else None
+    )
+    epochs_completed = 0
+    if not trainer.should_stop:
+        for epoch in range(start_epoch, args.epochs):
+            trainer.train_epoch(epoch, train_loader, prefix="distill")
+            best_ckpt = trainer.run_validation(val_loader, epoch, prefix="distill")
+            epochs_completed += 1
+            if trainer.should_stop:
+                break
+    else:
+        print("[EarlyStopping] Resumed checkpoint already reached stopping criterion.")
 
+    args._phase_epochs_completed = epochs_completed
     print(f"Phase 1 Complete. Best Checkpoint: {best_ckpt}")
     return best_ckpt

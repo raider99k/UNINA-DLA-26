@@ -41,19 +41,21 @@ Because the teacher outputs soft probability distributions across multiple adjac
 
 Across the project, multiple model generations were trained and evaluated on FSOCO (9,256 train images, 1,157 validation images, input size 480 x 768):
 
-| Metric | Gen 1 (Initial Distilled) | Gen 2 (SOD Rebalanced) | Gen 2.5 (Scratch Baseline) | Gen 2.5 (Pretrained Backbone) | Gen 2.6 (Hardware-Verified Champion) | Gen 2.6 (150-Epoch Extended) | Gen 3.1 (Spatial Neck Experiment) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Backbone** | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` (Stages 0-3) | **RepVGG `[2, 4, 14, 1]` (100% Stages 0-4, groups=1)** | **RepVGG `[2, 4, 14, 1]` (100% Stages 0-4, groups=1)** | RepVGG `[2, 4, 14, 1]` + DLASPPF |
-| **Neck Channels** | `[128, 256, 256]` | `[192, 192, 128]` | `[256, 192, 128]` | `[256, 192, 128]` | `[256, 192, 128]` (groups=1) | `[256, 192, 128]` (groups=1) | `[256, 192, 128]` |
-| **Neck Type** | Pointwise 1x1 | Pointwise 1x1 | Pointwise 1x1 | Pointwise 1x1 | **Pointwise 1x1 + nn.Upsample(nearest)** | Pointwise 1x1 + ConvTranspose2d (deconv) | Spatial Rep-PAN (1x1 -> 3x3) |
-| **Deploy Params** | 24.11M | 18.55M | 21.26M | 21.26M | **21.93M** (nearest) / 22.14M | **22.14M** (deconv) | 22.82M |
-| **Deploy FLOPs** | 37.2 GFLOPs | 32.2 GFLOPs | 55.4 GFLOPs | 55.4 GFLOPs | **56.0 GFLOPs** | **56.0 GFLOPs** | 60.9 GFLOPs |
-| **Phase 1 Dense mAP50 (O2O)** | 83.87% | 84.14% | 84.78% | 86.15% | **86.22%** | **89.09% (deploy) / 81.21% (raw)** | 84.69% |
-| **Phase 1 Dense mAP50 (NMS)** | 85.61% | 85.45% | 86.08% | 87.18% | **87.45%** | **89.57% (deploy) / 87.47% (raw)** | 85.98% |
-| **O2O vs NMS Gap (Dense)** | -1.74% | -1.31% | -1.30% | **-1.03%** | **-1.23%** | **-0.48% (deploy) / -6.26% (raw)** | -1.29% |
-| **Phase 1.5 Sparse mAP50 (O2O)** | 81.30% | 81.42% | 81.97% | **81.64%** | **77.28%** | **89.19% (deploy) / 77.61% (raw)** | 81.89% |
-| **Phase 2 QAT mAP50 (O2O)** | 82.59% | 82.80% | 83.78% | 83.05% | **85.17%** | **89.31% (deploy) / 78.58% (raw)** | 83.19% |
-| **CBUF Peak SRAM Banks** | 10 / 16 banks | 7 / 16 banks | 9 / 16 banks | 9 / 16 banks | **3 / 16 banks (INT8) / 4 (FP16)** | **3 / 16 banks (INT8) / 4 (FP16)** | 9 / 16 banks |
+| Metric | Gen 1 (Initial Distilled) | Gen 2 (SOD Rebalanced) | Gen 2.5 (Scratch Baseline) | Gen 2.5 (Pretrained Backbone) | Gen 2.6 (Hardware-Verified Champion) | Gen 2.6 (150-Epoch Extended) | Gen 3.1 (Spatial Neck Experiment) | Gen 3.2 (150+30+15 QAT, `--formula_image`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Backbone** | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` | RepVGG `[2, 4, 14, 1]` (Stages 0-3) | **RepVGG `[2, 4, 14, 1]` (100% Stages 0-4, groups=1)** | **RepVGG `[2, 4, 14, 1]` (100% Stages 0-4, groups=1)** | RepVGG `[2, 4, 14, 1]` + DLASPPF | **RepVGG `[2, 4, 14, 1]` + DLASPPF (100% Stages 0-4, groups=1)** |
+| **Neck Channels** | `[128, 256, 256]` | `[192, 192, 128]` | `[256, 192, 128]` | `[256, 192, 128]` | `[256, 192, 128]` (groups=1) | `[256, 192, 128]` (groups=1) | `[256, 192, 128]` | `[256, 192, 128]` (groups=1) |
+| **Neck Type** | Pointwise 1x1 | Pointwise 1x1 | Pointwise 1x1 | Pointwise 1x1 | **Pointwise 1x1 + nn.Upsample(nearest)** | Pointwise 1x1 + ConvTranspose2d (deconv) | Spatial Rep-PAN (1x1 -> 3x3) | Spatial Rep-PAN (1x1 -> 3x3) + ConvTranspose2d (deconv) |
+| **Deploy Params** | 24.11M | 18.55M | 21.26M | 21.26M | **21.93M** (nearest) / 22.14M | **22.14M** (deconv) | 22.82M | Not logged |
+| **Deploy FLOPs** | 37.2 GFLOPs | 32.2 GFLOPs | 55.4 GFLOPs | 55.4 GFLOPs | **56.0 GFLOPs** | **56.0 GFLOPs** | 60.9 GFLOPs | Not logged |
+| **Phase 1 Dense mAP50 (O2O)** | 83.87% | 84.14% | 84.78% | 86.15% | **86.22%** | **89.09% (deploy) / 81.21% (raw)** | 84.69% | Not logged |
+| **Phase 1 Dense mAP50 (NMS)** | 85.61% | 85.45% | 86.08% | 87.18% | **87.45%** | **89.57% (deploy) / 87.47% (raw)** | 85.98% | Not logged |
+| **O2O vs NMS Gap (Dense)** | -1.74% | -1.31% | -1.30% | **-1.03%** | **-1.23%** | **-0.48% (deploy) / -6.26% (raw)** | -1.29% | Not logged |
+| **Phase 1.5 Sparse mAP50 (O2O)** | 81.30% | 81.42% | 81.97% | **81.64%** | **77.28%** | **89.19% (deploy) / 77.61% (raw)** | 81.89% | Not logged |
+| **Phase 2 QAT mAP50 (O2O)** | 82.59% | 82.80% | 83.78% | 83.05% | **85.17%** | **89.31% (deploy) / 78.58% (raw)** | 83.19% | Not logged |
+| **Phase 4 Test mAP50 (`conf>0.001`)** | - | - | - | - | - | 79.29% | - | **90.0%** |
+| **Phase 4 Test mAP50-95 (`conf>0.001`)** | - | - | - | - | - | 53.03% | - | **66.0%** |
+| **CBUF Peak SRAM Banks** | 10 / 16 banks | 7 / 16 banks | 9 / 16 banks | 9 / 16 banks | **3 / 16 banks (INT8) / 4 (FP16)** | **3 / 16 banks (INT8) / 4 (FP16)** | 9 / 16 banks | Not logged |
 
 ### Key Takeaways
 1. **Gen 2.5 with Pretrained Backbone reaches State-of-the-Art Accuracy**:
@@ -70,7 +72,9 @@ Across the project, multiple model generations were trained and evaluated on FSO
    - Surpasses Gen 2.5 INT8 QAT (83.05%) by **+2.12% mAP50** while reducing CBUF peak SRAM pressure from 9 to **3 / 16 banks** with 100% strict DLA hardware residency.
 5. **Gen 2.6 Extended 150-Epoch Schedule Dynamics & Stagnation Analysis**:
    - Extending Phase 1 training to 150 epochs elevated operational deployment performance (`conf=0.25`, `iou=0.60`) to an all-time peak: **89.09% Phase 1 O2O mAP50** (89.57% NMS, gap narrowed to **-0.48%**), **89.19% Sparse mAP50**, and **89.31% QAT mAP50**.
-   - However, the run exhibited a severe 40-epoch plateau between Epoch 110 and 150 (gaining only +0.2% deployment mAP) because the auxiliary TAL loss decayed to exact zero ($\alpha_{\text{aux}} = 0.00$) at Epoch 140, starving Hungarian single-anchor matching ($top\text{-}k=1$) of gradient density. On the unseen test split (1,158 images), the model achieved **79.29% mAP50**, highlighting validation batch over-memorization from non-shuffled rectangular training.
+   - However, the run exhibited a severe 40-epoch plateau between Epoch 110 and 150 (gaining only +0.2% deployment mAP) because the auxiliary TAL loss decayed to exact zero ($\alpha_{\text{aux}} = 0.00$) at Epoch 140, starving Hungarian single-anchor matching ($top\text{-}k=1$) of gradient density. On the unseen test split (1,158 images), Phase 4 evaluation ran only at the raw `conf>0.001` threshold and achieved **79.29% mAP50** (53.03% mAP50-95)—matching/exceeding QAT's **78.58%** peak (**77.41%** Epoch 15) validation score at the same `conf>0.001` threshold, confirming solid split generalization rather than overfitting.
+6. **Gen 3.2 Standalone (150 + 30 + 15 Schedule, `--formula_image`) Achieves New Held-Out Test Record**:
+   - Training Generation 3.2 (`RepVGG [2, 4, 14, 1] + DLASPPF`, Spatial $3\times 3$ Rep-PAN neck, `upsample=deconv`, unbounded LTRB regression) across the full **150 Dense + 30 Sparse + 15 QAT** schedule with `--formula_image`, non-zero auxiliary tail (`--o2m_aux_weight_end 0.15`), and extended TAL top-$k$ curriculum (`0.25` / `0.45`) elevated Phase 4 Held-Out Test Split performance (`1,158` images, `conf>0.001`) to **90.0% mAP50** and **66.0% mAP50-95**—a **+10.71 percentage-point** jump in mAP50 and **+12.97 percentage-point** jump in mAP50-95 over the Gen 2.6 150-Epoch Test result (79.29% / 53.03% at the exact same `conf>0.001` threshold).
 
 ---
 
@@ -317,8 +321,8 @@ Complete multi-phase progression for the extended 150-epoch Generation 2.6 train
   - 100% strict DLA compatibility verification passed (`VERDICT: PASS - Model is DLA-compatible`).
   - Saved 70 INT8 quantization scales to `unina_dla_best_qat_sparse_qatclean_480x768_int8_scales.json`.
 - **Phase 4 Evaluation on Completely Held-Out Test Split (1,158 Images)**:
-  - Standard evaluation protocol (`conf>0.001`):
-    - **Final Test Set mAP50 = 79.29%**, **mAP50-95 = 53.03%**
+  - Standard raw evaluation protocol (`conf>0.001` only; Phase 4 does not run a `conf=0.25` deployment pass):
+    - **Final Test Set mAP50 = 79.29%**, **mAP50-95 = 53.03%** (comparable to QAT validation `conf>0.001`: **78.58%** peak / **77.41%** Epoch 15)
     - `class0` (`yellow_cone`): **80.0%** AP50, 50.3% AP50-95
     - `class1` (`blue_cone`): **81.6%** AP50, 52.8% AP50-95
     - `class2` (`small_orange_cone`): **77.4%** AP50, 50.7% AP50-95
@@ -330,7 +334,92 @@ Complete multi-phase progression for the extended 150-epoch Generation 2.6 train
    - **Root Cause**: The dynamic auxiliary loss weight decayed to exact zero ($\alpha_{\text{aux}} = 0.00$) at Epoch 140, completely disabling the dense One-to-Many branch. With learning rate bottoming out at $1.3 \times 10^{-4}$, strict single-anchor Hungarian matching ($top\text{-}k=1$) lacked gradient density to push weights further.
 2. **Sparsity Overshooting (30 Epochs vs 6 Epochs)**:
    - In the initial unaligned run, dynamically extending 2:4 structured sparsity to 30 epochs without fused layer optimizer tracking degraded low-confidence feature representations (raw O2O dropped to 64.39%). After fixing optimizer parameter registration and checkpoint loading, the resumed 30-epoch run maintained **77.61% raw O2O mAP50** and **89.19% deploy mAP50**.
-3. **Generalization Gap on Unseen Test Split**:
-   - The model achieved 89.1% mAP50 at `conf=0.25` on the validation split, but 79.3% mAP50 at `conf>0.001` on the unseen test split. Non-shuffled rectangular training enabled slight over-fitting to validation batch aspect ratios over 150 epochs.
+3. **Threshold Comparison Note on Test Split (`conf>0.001` vs `conf=0.25`)**:
+   - The **89.31% mAP50** QAT validation metric was measured at the deployment threshold (`conf=0.25`), whereas Phase 4 test evaluation (`scripts/train_student.py`) runs `validate()` at the default raw threshold (`conf>0.001`), yielding **79.29% mAP50**.
+   - Compared apples-to-apples at `conf>0.001`, Test (**79.29%**) matches or slightly exceeds QAT validation (**78.58%** peak at Epoch 5, **77.41%** at Epoch 15), showing no validation overfitting gap—though enabling per-epoch shuffling via `--formula_image` remains good practice to avoid static rectangular batch ordering.
+
+---
+
+### 4.6 Generation 3.2 Extended Standalone Pipeline (150 Dense + 30 Sparse + 15 QAT, `deconv`, `--formula_image`)
+
+Completed multi-phase run for **Generation 3.2** (`RepVGG [2, 4, 14, 1] + DLASPPF`, `Spatial` $3 \times 3$ Rep-PAN neck with `[256, 192, 128]` channels, `upsample_mode=deconv`, unbounded LTRB regression, 100% RepVGG-A1 Stages 0–4 pretraining) over the full **150 + 30 + 15** epoch schedule without early-stop termination (`195` total epochs across all three phases). Although `--teacher` was supplied on the command line, `--enable_distillation` was not set, so training and QAT executed in standalone mode.
+
+#### Training Configuration
+```bash
+python scripts/train_student.py \
+    --teacher "{LOCAL_TEACHER_PATH}" \
+    --data unina_dla/config/unina_dla_data.yaml \
+    --data_path "{CANONICAL_DATASET_DIR}" \
+    --project "{STUDENT_PROJECT_DIR}" \
+    --name "{STUDENT_RUN_NAME}" \
+    --version 3.2 \
+    --upsample_mode deconv \
+    --warmup_epochs 5 \
+    --epochs_sparsity 30 \
+    --epochs_qat 15 \
+    --patience 25 \
+    --min_delta 0.001 \
+    --early_stop_metric fitness \
+    --early_stop_min_epochs 75 \
+    --patience_sparsity 5 \
+    --patience_qat 4 \
+    --o2m_aux_weight_end 0.15 \
+    --o2o_topk_stage1_pct 0.25 \
+    --o2o_topk_stage2_pct 0.45 \
+    --optimizer MuSGD \
+    --pretrained_backbone \
+    --enable_sparsity \
+    --enable_qat \
+    --formula_image \
+    --qat-clean-deploy \
+    --epochs 150 \
+    --batch 16 \
+    --imgsz 768,480 \
+    --no-compile
+```
+
+#### Phase 4 Evaluation on Held-Out Test Split (1,158 Images)
+Evaluated after Phase 2 QAT + Phase 3 clean deploy export on the unseen FSOCO test set (`conf>0.001`, NMS-free O2O):
+- **Images**: `1,158`
+- **Predictions (`conf>0.001`)**: `40,117`
+- **Speed**: `0.0ms` preprocess, `2.7ms` inference, `0.2ms` postprocess per image at shape `(16, 3, 480, 768)`
+
+| Class | Category Name | Test AP50 (`conf>0.001`) | Test AP50-95 (`conf>0.001`) | Delta vs Gen 2.6 150-Epoch Test (Section 4.5) |
+| :--- | :--- | :---: | :---: | :---: |
+| `class0` | `yellow_cone` | **91.6%** | **64.8%** | **+11.6 pp** AP50 / **+14.5 pp** AP50-95 |
+| `class1` | `blue_cone` | **90.4%** | **64.8%** | **+8.8 pp** AP50 / **+12.0 pp** AP50-95 |
+| `class2` | `small_orange_cone` | **89.9%** | **65.3%** | **+12.5 pp** AP50 / **+14.6 pp** AP50-95 |
+| `class3` | `large_orange_cone` | **88.1%** | **69.1%** | **+9.9 pp** AP50 / **+10.8 pp** AP50-95 |
+| **Mean** | **All Classes** | **90.0%** | **66.0%** | **+10.71 pp** AP50 / **+12.97 pp** AP50-95 |
+
+#### Post-Export TensorRT Engine Validation (NVIDIA Tesla T4, TensorRT 10.16.1.11)
+Evaluated the compiled Gen 3.2 TensorRT engines directly on **Tesla T4** via `scripts/benchmark.py` (`480 x 768`, batch size 1, 50 warmup, 200 timed iterations) against FP16 and INT8-PTQ YOLO26 baselines in the same environment:
+
+- **UNINA-QAT-INT8 (`19.9 MB`)**: **87.3% mAP50** (**62.2% mAP50-95**) | **2.52 ms** inference | **279.6 FPS** E2E (`3.58 ms` E2E, `4.09 ms` P95)
+- **UNINA-QAT-FP16 (`38.5 MB`)**: **87.5% mAP50** (**62.0% mAP50-95**) | **4.25 ms** inference | **187.4 FPS** E2E (`5.34 ms` E2E, `5.53 ms` P95)
+- **UNINA-Sparse-FP16 (`38.5 MB`)**: **87.7% mAP50** (**61.8% mAP50-95**) | **4.26 ms** inference | **188.8 FPS** E2E (`5.30 ms` E2E, `5.48 ms` P95)
+- **Baselines in the same T4 TensorRT 10.16 run**:
+  - `YOLO26N-FP16` (`6.8 MB`): 78.7% mAP50 / 52.2% mAP50-95 | 1.78 ms | 376.1 FPS (`YOLO26N-INT8`: 76.6% / 49.6% | 1.70 ms | 382.0 FPS)
+  - `YOLO26S-FP16` (`20.4 MB`): 84.1% mAP50 / 58.2% mAP50-95 | 2.75 ms | 275.0 FPS (`YOLO26S-INT8`: 70.6% / 45.3% | 1.91 ms | 358.7 FPS)
+  - `YOLO26X-FP16` (`108.8 MB`): 89.3% mAP50 / 63.0% mAP50-95 | 12.84 ms | 72.7 FPS (`YOLO26X-INT8`: 83.8% / 52.5% | 7.50 ms | 118.4 FPS)
+- **QAT Retention**: Comparing `UNINA-QAT-INT8` directly against `UNINA-QAT-FP16`, explicit Q/DQ INT8 quantization retained **99.8%** of mAP50 (`87.3%` vs `87.5%`, `-0.2 pp`) and **100%** of mAP50-95 (`62.2%` vs `62.0%`, `+0.2 pp`) while shrinking engine size by **48.3%** and boosting inference speed by **1.69x**—in sharp contrast to Ultralytics INT8 PTQ, which dropped `YOLO26S` by **-13.5 pp** mAP50 (`-12.9 pp` mAP50-95) and `YOLO26X` by **-5.5 pp** mAP50 (`-10.5 pp` mAP50-95).
+- **Dependency Change Caveat**: This T4 validation used **TensorRT `10.16.1.11`**, an upgraded **`ultralytics 8.4.x`** (`Settings v0.0.8` `compute_ap` update, which lowers mAP at deployment threshold relative to `8.4.4`), and slim `scripts/build_engine.py` FP16 YOLO exports. Because of these environment differences, direct 1:1 comparisons with historical runs in Sections 4.4–4.5 or earlier benchmark tables may not be exact.
+
+#### Post-Export Workstation Validation (NVIDIA RTX PRO 6000 Blackwell, TensorRT 10.16.1.11 & PyTorch Eager)
+
+- **PyTorch Eager (`480x768`, Batch=1, CUDA)**:
+  - **`UNINA-Standalone`**: `88.1%` mAP50, `63.0%` mAP50-95, `2.45 ms` infer (`2.78 ms` E2E, `359.7 FPS`, `92.3 MB`)
+  - **`UNINA-Sparse`**: `87.7%` mAP50, `61.8%` mAP50-95, `2.45 ms` infer (`2.78 ms` E2E, `360.3 FPS`, `92.3 MB`) — matches standalone latency because PyTorch eager executes dense `Conv2d` kernels over zero-masked 2:4 weights.
+  - **`UNINA-QAT`**: `87.3%` mAP50, `62.1%` mAP50-95, `12.71 ms` infer (`13.06 ms` E2E, `76.6 FPS`, `23.1 MB`) — simulated `Q/DQ` overhead before TensorRT lowering.
+  - **YOLOv26 Baselines (PyTorch)**: `YOLO26X` (`89.3%` / `63.0%`, `7.48 ms` infer, `128.9 FPS`), `YOLO26S` (`84.1%` / `58.2%`, `3.04 ms` infer, `301.8 FPS`), `YOLO26N` (`78.7%` / `52.2%`, `2.86 ms` infer, `320.4 FPS`).
+- **TensorRT `10.16.1.11` Engines (`480x768`, Batch=1)**:
+  - **`UNINA-QAT-INT8`**: **`87.3%` mAP50**, **`62.2%` mAP50-95**, **`0.57 ms` infer** (`0.88 ms` E2E, `1,140.0 FPS`, `26.8 MB`)
+  - **`UNINA-Standalone-FP16`**: `87.9%` mAP50, `63.0%` mAP50-95, `0.63 ms` infer (`0.93 ms` E2E, `1,070.9 FPS`, `39.2 MB`)
+  - **`UNINA-Sparse-FP16`**: `87.7%` mAP50, `61.8%` mAP50-95, `0.63 ms` infer (`0.93 ms` E2E, `1,075.2 FPS`, `41.5 MB`)
+  - **`UNINA-QAT-FP16`**: `87.5%` mAP50, `62.0%` mAP50-95, `0.62 ms` infer (`0.95 ms` E2E, `1,055.5 FPS`, `41.9 MB`)
+  - **YOLOv26-FP16 Baselines**: `YOLO26N-FP16` (`78.4%` / `51.7%`, `0.65 ms` infer, `1,143.7 FPS`, `6.3 MB`), `YOLO26S-FP16` (`83.8%` / `57.5%`, `0.78 ms` infer, `1,000.9 FPS`, `20.0 MB`), `YOLO26X-FP16` (`88.8%` / `62.2%`, `2.07 ms` infer, `435.4 FPS`, `108.5 MB`).
+- **Dependency & Batch=1 Caveat**: Same **TensorRT `10.16.1.11`**, upgraded **`ultralytics 8.4.x`**, and slim `scripts/build_engine.py` FP16 YOLO export environment as the T4 run; `batch=1` execution on RTX PRO 6000 is launch/memory-bandwidth bound (~`0.57–0.63 ms`), making sparse and dense FP16 engines run at identical speed and compressing INT8 vs FP16 gains compared to Tesla T4.
+
+
 
 

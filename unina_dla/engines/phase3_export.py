@@ -41,6 +41,7 @@ def _prepare_clean_deploy_state_dict(state_dict):
         "_input_quantizer",
         "_weight_quantizer",
         "_output_quantizer",
+        "shared_quantizer",
         "_pre_quant_scale",
         "_amax",
         "_calibrator",
@@ -171,16 +172,14 @@ def run_export(args):
     clean_qat_deploy = bool(getattr(args, "qat_clean_deploy", False)) and source_is_qat
     export_with_qat_graph = source_is_qat and not clean_qat_deploy
 
-    # Select weights: prefer EMA for non-QAT models if available (matches validation)
+    # Select weights: prefer EMA if available (matches validation across all phases)
     raw_sd = ckpt
-    if not source_is_qat and isinstance(ckpt, dict):
+    if isinstance(ckpt, dict):
         if "ema" in ckpt and isinstance(ckpt["ema"], dict) and len(ckpt["ema"]) > 0:
             raw_sd = ckpt["ema"]
             print("[Export] Using EMA weights from checkpoint (matches best validation).")
         elif "model" in ckpt and isinstance(ckpt["model"], dict):
             raw_sd = ckpt["model"]
-    elif isinstance(ckpt, dict) and "model" in ckpt:
-        raw_sd = ckpt["model"]
 
     # Clean state_dict: remove compiler wrappers (_orig_mod.) and profiling artifacts
     state_dict = {}
@@ -385,15 +384,8 @@ def run_export(args):
         else:
             print("[Export] Exporting single-file ONNX (embedded weights).")
 
-    if export_with_qat_graph and supports_dynamo:
-        print(
-            "[Export] QAT export forcing legacy ONNX tracer (dynamo=False) to avoid torch.export symbolic guard issues."
-        )
+    if supports_dynamo:
         export_kwargs["dynamo"] = False
-    elif export_with_qat_graph:
-        print(
-            "[Export] QAT export using default ONNX tracer (torch.onnx.export has no dynamo parameter in this torch build)."
-        )
 
     try:
         torch.onnx.export(**export_kwargs)

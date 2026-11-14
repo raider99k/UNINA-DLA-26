@@ -40,7 +40,7 @@ def muon_update(
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
     update = zeropower_via_newtonschulz5(update)
-    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
+    update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
     return update
 
 
@@ -107,6 +107,13 @@ class MuSGD(optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
                         state["momentum_buffer_SGD"] = torch.zeros_like(p)
 
+                    # Compute weight-decayed gradient on current parameter p_t before in-place Muon update
+                    grad_sgd = (
+                        grad.add(p, alpha=group["weight_decay"])
+                        if group["weight_decay"] != 0
+                        else grad
+                    )
+
                     update = muon_update(
                         grad,
                         state["momentum_buffer"],
@@ -116,11 +123,9 @@ class MuSGD(optim.Optimizer):
                     p.add_(update.reshape(p.shape), alpha=-(lr * self.muon_ratio))
 
                     # SGD update
-                    if group["weight_decay"] != 0:
-                        grad = grad.add(p, alpha=group["weight_decay"])
-                    state["momentum_buffer_SGD"].mul_(group["momentum"]).add_(grad)
+                    state["momentum_buffer_SGD"].mul_(group["momentum"]).add_(grad_sgd)
                     sgd_update = (
-                        grad.add(state["momentum_buffer_SGD"], alpha=group["momentum"])
+                        grad_sgd.add(state["momentum_buffer_SGD"], alpha=group["momentum"])
                         if group["nesterov"]
                         else state["momentum_buffer_SGD"]
                     )

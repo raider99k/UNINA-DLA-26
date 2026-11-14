@@ -24,6 +24,66 @@ from unina_dla.engines.phase2_qat import run_qat
 from unina_dla.engines.phase3_export import run_export
 
 
+AUGMENTATION_KEYS = (
+    "hsv_h",
+    "hsv_s",
+    "hsv_v",
+    "degrees",
+    "translate",
+    "scale",
+    "shear",
+    "perspective",
+    "flipud",
+    "fliplr",
+    "bgr",
+    "mosaic",
+    "mixup",
+    "copy_paste",
+    "auto_augment",
+    "erasing",
+    "close_mosaic",
+)
+
+
+def apply_yaml_augmentations(
+    data_cfg, data_cfg_dict=None, yaml_path=None, close_mosaic_override=None
+):
+    """Merge augmentation hyperparameters from dataset YAML into Ultralytics data_cfg namespace."""
+    merged_yaml = {}
+    if yaml_path and os.path.exists(yaml_path):
+        try:
+            import yaml
+
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                raw_yaml = yaml.safe_load(f)
+            if isinstance(raw_yaml, dict):
+                merged_yaml.update(raw_yaml)
+        except Exception:
+            pass
+    if isinstance(data_cfg_dict, dict):
+        merged_yaml.update(data_cfg_dict)
+
+    applied = {}
+    for k in AUGMENTATION_KEYS:
+        if k in merged_yaml and merged_yaml[k] is not None:
+            val = merged_yaml[k]
+            if k == "auto_augment" and isinstance(val, str) and val.strip().lower() == "none":
+                val = None
+            setattr(data_cfg, k, val)
+            applied[k] = val
+
+    # If auto_augment is disabled and erasing wasn't explicitly set in YAML, disable random erasing
+    if getattr(data_cfg, "auto_augment", None) is None and "erasing" not in applied:
+        data_cfg.erasing = 0.0
+        applied["erasing"] = 0.0
+
+    if close_mosaic_override is not None:
+        data_cfg.close_mosaic = int(close_mosaic_override)
+        applied["close_mosaic"] = int(close_mosaic_override)
+
+    return applied
+
+
 def calculate_finetune_epochs(base_epochs: int, pct: float = 0.10) -> int:
     """Proportional epoch scheduling for fine-tuning phases with min 1, max 30 guards."""
     raw_pct = int(base_epochs * pct)
@@ -67,19 +127,25 @@ def main():
         "--version",
         type=str,
         default=None,
-        choices=["2.6", "2.5", "3.1", "2", "3"],
-        help="Architecture generation (defaults to 2.5 for fresh training, or auto-detected from checkpoint)",
+        choices=["3.2", "2.6", "2.5", "3.1", "2", "3"],
+        help="Architecture generation (defaults to 3.2 for fresh training, or auto-detected from checkpoint)",
     )
     parser.add_argument(
         "--upsample_mode",
         type=str,
         default=None,
         choices=["nearest", "deconv", "bilinear"],
-        help="Upsampling mode in Rep-PAN neck (defaults to architecture preset, e.g. nearest for 2.6, deconv for 2.5)",
+        help="Upsampling mode in Rep-PAN neck (defaults to architecture preset: deconv for 3.2/2.5, nearest for 2.6)",
     )
 
     # Phase 1: Distillation
     parser.add_argument("--epochs", type=int, default=150, help="Phase 1 Epochs")
+    parser.add_argument(
+        "--close_mosaic",
+        type=int,
+        default=10,
+        help="Disable Mosaic/Mixup/CopyPaste for the final N epochs of Phase 1 (set 0 to disable)",
+    )
     parser.add_argument(
         "--warmup_epochs",
         type=int,
@@ -103,7 +169,7 @@ def main():
         "--weight_decay",
         type=float,
         default=None,
-        help="Weight decay (defaults to 1e-4 for AdamW, 1e-5 for MuSGD)",
+        help="Weight decay (defaults to 1e-4 for AdamW, 5e-4 for MuSGD/SGD)",
     )
     parser.add_argument(
         "--enable_distillation", action="store_true", help="Enable Knowledge Distillation"
@@ -419,7 +485,54 @@ def main():
         "--no-compile", action="store_false", dest="compile", help="Disable torch.compile"
     )
 
+    # Early Stopping
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=0,
+        help="Early stopping patience in epochs for Phase 1 (0 disables early stopping)",
+    )
+    parser.add_argument(
+        "--patience_sparsity",
+        type=int,
+        default=None,
+        help="Early stopping patience in epochs for Phase 1.5 Sparsity (defaults to disabled)",
+    )
+    parser.add_argument(
+        "--patience_qat",
+        type=int,
+        default=None,
+        help="Early stopping patience in epochs for Phase 2 QAT (defaults to disabled)",
+    )
+    parser.add_argument(
+        "--min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation metric improvement required to reset early stopping patience",
+    )
+    parser.add_argument(
+        "--early_stop_metric",
+        type=str,
+        default="mAP50",
+        choices=["mAP50", "mAP50-95", "fitness"],
+        help="Validation metric monitored by early stopping (fitness = 0.1*mAP50 + 0.9*mAP50-95)",
+    )
+    parser.add_argument(
+        "--early_stop_min_epochs",
+        type=int,
+        default=None,
+        help="Minimum Phase 1 epochs before early stopping patience begins counting (defaults to warmup epochs)",
+    )
+
     args = parser.parse_args()
+    args.patience = max(0, int(args.patience or 0))
+    if args.patience_sparsity is not None:
+        args.patience_sparsity = max(0, int(args.patience_sparsity))
+    if args.patience_qat is not None:
+        args.patience_qat = max(0, int(args.patience_qat))
+    args.min_delta = max(0.0, float(args.min_delta or 0.0))
+    if args.early_stop_min_epochs is not None:
+        args.early_stop_min_epochs = max(0, int(args.early_stop_min_epochs))
     args._o2m_aux_weight_end_distill_explicit = args.o2m_aux_weight_end_distill is not None
 
     if args.kd_mech_all:
@@ -434,7 +547,7 @@ def main():
         args.lr = 0.001 if args.optimizer.lower() == "adamw" else 0.01
 
     if args.weight_decay is None:
-        args.weight_decay = 1e-4 if args.optimizer.lower() == "adamw" else 1e-5
+        args.weight_decay = 1e-4 if args.optimizer.lower() == "adamw" else 5e-4
 
     if args.backbone_lr_ratio is None:
         args.backbone_lr_ratio = 1.0
@@ -530,6 +643,16 @@ def main():
 
         with open(args.data) as f:
             data_cfg_dict = yaml.safe_load(f)
+
+    # Merge custom student augmentations from dataset YAML into data_cfg
+    applied_augs = apply_yaml_augmentations(
+        data_cfg,
+        data_cfg_dict=data_cfg_dict,
+        yaml_path=args.data,
+        close_mosaic_override=getattr(args, "close_mosaic", None),
+    )
+    if applied_augs:
+        print(f"[Augmentations] Applied dataset YAML overrides: {applied_augs}")
 
     # Expand user path '~' if present in 'path'
     if "path" in data_cfg_dict and isinstance(data_cfg_dict["path"], str):
@@ -679,7 +802,7 @@ def main():
         phase1_ran = True
 
     if phase1_ran:
-        _advance_tb_offsets(train_loader, args.epochs)
+        _advance_tb_offsets(train_loader, getattr(args, "_phase_epochs_completed", args.epochs))
 
     # Check if checkpoint already has sparsity enabled
     try:
@@ -708,7 +831,9 @@ def main():
             sparse_ran = True
 
     if sparse_ran:
-        _advance_tb_offsets(train_loader, args.epochs_sparsity)
+        _advance_tb_offsets(
+            train_loader, getattr(args, "_phase_epochs_completed", args.epochs_sparsity)
+        )
 
     # ---------------------------------------------------------
     # Phase 2: QAT
@@ -768,7 +893,7 @@ def main():
         qat_ran = True
 
     if qat_ran:
-        _advance_tb_offsets(train_loader, args.epochs_qat)
+        _advance_tb_offsets(train_loader, getattr(args, "_phase_epochs_completed", args.epochs_qat))
 
     # ---------------------------------------------------------
     # Phase 3: Export to ONNX (DLA-Optimized)
@@ -852,7 +977,7 @@ def main():
                     verification_input_size=(1, 3, args.imgsz_hw[0], args.imgsz_hw[1]),
                 )
                 test_model.load_state_dict(state_dict, strict=False)
-                enable_quantization(test_model)
+                enable_quantization(test_model, device=device)
             else:
                 test_model.load_state_dict(state_dict, strict=False)
 
@@ -885,14 +1010,43 @@ def main():
                 max_det=int(getattr(args, "max_det", 300)),
             )
 
-            print(f"\nFinal Test Set mAP50: {results['mAP50']:.4f}")
-            print(f"Final Test Set mAP50-95: {results['mAP50-95']:.4f}")
+            print(f"\nFinal Test Set (conf=0.001) mAP50: {results['mAP50']:.4f}")
+            print(f"Final Test Set (conf=0.001) mAP50-95: {results['mAP50-95']:.4f}")
+
+            deploy_conf = float(getattr(args, "deploy_eval_conf", 0.25))
+            deploy_iou = float(getattr(args, "deploy_eval_iou", 0.6))
+            print(
+                f"\nRunning Test Set Deployment Validation (conf={deploy_conf:.3f}, iou={deploy_iou:.3f})..."
+            )
+            deploy_results, _ = validate(
+                test_model,
+                test_loader,
+                device=device,
+                conf_thres=deploy_conf,
+                iou_thres=deploy_iou,
+                num_classes=num_classes,
+                names=data_cfg.get("names", {}),
+                save_dir=None,
+                prefix=f"{test_prefix}deploy_",
+                nms=use_nms,
+                max_det=int(getattr(args, "max_det", 300)),
+            )
+
+            print(
+                f"\nFinal Test Set (conf={deploy_conf:.2f}) mAP50: {deploy_results['mAP50']:.4f}"
+            )
+            print(
+                f"Final Test Set (conf={deploy_conf:.2f}) mAP50-95: {deploy_results['mAP50-95']:.4f}"
+            )
 
             # Save to file with dynamic name
             metrics_save_path = os.path.join(args.output_dir, f"{lineage_prefix}test_metrics.txt")
             with open(metrics_save_path, "w") as f:
                 f.write(f"mAP50: {results['mAP50']}\n")
                 f.write(f"mAP50-95: {results['mAP50-95']}\n")
+                f.write(f"deploy_conf: {deploy_conf}\n")
+                f.write(f"deploy_mAP50: {deploy_results['mAP50']}\n")
+                f.write(f"deploy_mAP50-95: {deploy_results['mAP50-95']}\n")
 
         except Exception as e:
             print(f"[Warning] Failed to run test set evaluation: {e}")

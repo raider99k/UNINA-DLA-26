@@ -37,3 +37,5 @@ mosaic: 0.3  # reduced mosaic to avoid excessive sample distortion
 mixup: 0.0   # disable mixup for cleaner supervision
 copy_paste: 0.0  # segment copy-paste (probability)
 auto_augment: none # disable randaugment for baseline stability
+erasing: 0.0  # disable random erasing to preserve small distant cones
+close_mosaic: 10  # disable mosaic in the final 10 epochs for clean O2O calibration

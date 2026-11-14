@@ -145,6 +145,45 @@ Direct PyTorch CUDA execution evaluated using `scripts/benchmark.py` on the FSOC
 > [!NOTE]
 > - **Full PyTorch Up-sampling Fidelity**: In this validated PyTorch evaluation, `UNINA-Sparse` (**88.15% mAP50**, 62.46% mAP50-95) and `UNINA-QAT` (**88.31% mAP50**, 61.94% mAP50-95) were executed with automatic upsampling mode detection (`upsample=deconv` ConvTranspose2d) and EMA weights, demonstrating excellent feature pyramid spatial fidelity and eliminating previous interpolation mismatches.
 
+### Gen 3.2 Workstation Follow-Up — TensorRT 10.16 & PyTorch Eager (RTX PRO 6000)
+
+- **Hardware**: NVIDIA RTX PRO 6000 Blackwell Server Edition (Device 0)
+- **Settings**: Resolution `480x768`, Batch `1`, Warmup `50`, Iterations `200`
+
+> [!WARNING]
+> **Dependency, Architecture & Engine-Build Caveat**: The Gen 3.2 workstation runs below were built and evaluated with **TensorRT `10.16.1.11`**, an upgraded **`ultralytics 8.4.x`** release (which changed `compute_ap` integration at `conf=0.25` relative to `8.4.4`), the upgraded **Gen 3.2** UNINA architecture (`24.2M` params, `45.7 GFLOPs`, `DLASPPF` + spatial 3x3 Rep-PAN + `deconv` vs Gen 2.6 `21.9M` 1x1 Rep-PAN + `nearest`), and slim FP16 YOLO exports built via `scripts/build_engine.py` (`6.3 / 20.0 / 108.5 MB` vs the legacy FP32-sized `11.8 / 38.9 / 215.5 MB` engines in the historical tables above). Because of these changes, **direct 1:1 comparisons against earlier Section 2 runs may not be exact**.
+
+#### TensorRT 10.16 Native Engine Execution (7-Model FP16 & INT8 Suite)
+
+| Model Name | Backend | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | Post (ms) | E2E (ms) | P95 (ms) | FPS |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`UNINA-QAT-INT8`** | TensorRT (GPU) | 26.8 | 0.873 | 0.622 | **0.57** | 0.20 | **0.88** | 0.90 | **1,140.0** |
+| **`UNINA-Sparse-FP16`** | TensorRT (GPU) | 41.5 | 0.877 | 0.618 | 0.63 | 0.19 | 0.93 | 0.94 | 1,075.2 |
+| **`UNINA-Standalone-FP16`** | TensorRT (GPU) | 39.2 | 0.879 | **0.630** | 0.63 | 0.19 | 0.93 | 0.95 | 1,070.9 |
+| **`UNINA-QAT-FP16`** | TensorRT (GPU) | 41.9 | 0.875 | 0.620 | 0.62 | 0.21 | 0.95 | 0.96 | 1,055.5 |
+| `YOLO26N-FP16` | TensorRT (GPU) | 6.3 | 0.784 | 0.517 | 0.65 | 0.11 | 0.87 | 0.89 | 1,143.7 |
+| `YOLO26S-FP16` | TensorRT (GPU) | 20.0 | 0.838 | 0.575 | 0.78 | 0.11 | 1.00 | 1.00 | 1,000.9 |
+| `YOLO26X-FP16` | TensorRT (GPU) | 108.5 | **0.888** | 0.622 | 2.07 | 0.12 | 2.30 | 2.31 | 435.4 |
+
+> [!NOTE]
+> - **QAT vs FP16 Precision & Size**: `UNINA-QAT-INT8` matches `UNINA-QAT-FP16` accuracy (`87.3%` vs `87.5%` mAP50, `62.2%` vs `62.0%` mAP50-95) while reducing engine size by **36.0%** (`26.8 MB` vs `41.9 MB`) and reaching **1,140.0 FPS** E2E (`0.57 ms` infer).
+> - **Batch=1 Sparse & INT8 Launch Bounds on Blackwell**: `UNINA-Sparse-FP16` (`0.63 ms`, `1,075.2 FPS`) performs identically to `UNINA-Standalone-FP16` (`0.63 ms`, `1,070.9 FPS`), and INT8 provides a smaller relative speedup than on Tesla T4 (`0.57 ms` vs `0.62–0.63 ms`) because `batch=1` inference at ~`0.6 ms` across the network's layers is launch- and memory-bandwidth-bound rather than Tensor Core math-bound.
+> - **YOLOv26 FP16 Comparison**: Within this controlled TensorRT 10.16 run, `UNINA-QAT-INT8` is **1.37x faster** on GPU inference (`0.57 ms` vs `0.78 ms`) and **+3.5 pp** higher in mAP50 (`+4.7 pp` mAP50-95) than `YOLO26S-FP16`, and **3.63x faster** (`0.57 ms` vs `2.07 ms`) with matching `62.2%` mAP50-95 compared to `YOLO26X-FP16`.
+
+#### PyTorch Eager Reference (CUDA, 6-Model Suite)
+
+| Model Name | Backend | Params (M) | GFLOPs | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | Post (ms) | E2E (ms) | P95 (ms) | FPS |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`UNINA-Standalone`** | PyTorch (CUDA) [Fused D... | 24.2M | 45.7 | 92.3 | 0.881 | **0.630** | **2.45** | 0.22 | **2.78** | 2.80 | 359.7 |
+| **`UNINA-Sparse`** | PyTorch (CUDA) [Fused D... | 24.2M | 45.7 | 92.3 | 0.877 | 0.618 | **2.45** | 0.21 | **2.78** | 2.79 | **360.3** |
+| **`UNINA-QAT`** | PyTorch (CUDA) [INT8 QA... | 24.2M | 45.7 | **23.1** | 0.873 | 0.621 | 12.71 | 0.24 | 13.06 | 13.19 | 76.6 |
+| `YOLO26X` | Ultralytics YOLO (CUDA) | 55.6M | 87.2 | 212.2 | **0.893** | **0.630** | 7.48 | 0.16 | 7.76 | 7.79 | 128.9 |
+| `YOLO26S` | Ultralytics YOLO (CUDA) | 9.5M | 9.3 | 36.1 | 0.841 | 0.582 | 3.04 | 0.16 | 3.31 | 3.34 | 301.8 |
+| `YOLO26N` | Ultralytics YOLO (CUDA) | 2.4M | 2.4 | 9.1 | 0.787 | 0.522 | 2.86 | 0.15 | 3.12 | 3.14 | 320.4 |
+
+> [!NOTE]
+> In PyTorch eager mode, `UNINA-Sparse` uses standard dense `Conv2d` kernels (the 2:4 pruning zeros are stored in normal dense FP32 tensors, so FLOPs and latency match `UNINA-Standalone` at `2.45 ms`), while `UNINA-QAT` runs simulated fake-quantize (`Q/DQ`) nodes (`12.71 ms`) that only accelerate after compiling to INT8 TensorRT (`0.57 ms`, a **22.3x** inference speedup).
+
 ---
 
 ## 3. Edge GPU Benchmarks (NVIDIA Tesla T4)
@@ -158,6 +197,36 @@ Direct PyTorch CUDA execution evaluated using `scripts/benchmark.py` on the FSOC
 | **UNINA-Sparse-Engine**| TensorRT FP16 | 35.9 | 78.7% | 46.0% | 4.18 | 0.50 | 5.17 | 5.44 | 193.6 | 0.80x |
 | **YOLO26S-Engine** | TensorRT FP16 | 109.0 | 90.8% | 67.5% | 8.08 | 0.22 | 8.78 | 8.90 | 113.9 | 0.41x |
 | **YOLO26X-Engine** | TensorRT FP16 | 460.3 | 93.6% | 71.2% | 48.07 | 0.25 | 48.85 | 49.55 | 20.5 | 0.07x |
+
+### TensorRT 10.16 Native Engine Execution — Gen 3.2 Suite (9-Model FP16 & INT8)
+
+Follow-up batch-1 evaluation of **Generation 3.2** (150 Dense + 30 Sparse + 15 QAT, `deconv` upsampling, `--formula_image`) alongside FP16 and INT8-PTQ YOLO26 baselines on **NVIDIA Tesla T4** (`480 x 768`, 50 warmup, 200 iterations):
+
+> [!WARNING]
+> **Cross-Run Comparison Caveat (Dependency & Export Changes)**:
+> - **TensorRT Runtime**: Built and executed with **TensorRT `10.16.1.11`** (`sm_75`), with explicit Q/DQ ONNX export for `UNINA-QAT-INT8` and stripped Ultralytics metadata headers for `YOLO26*-INT8`.
+> - **Ultralytics Metrics**: Executed under an upgraded **`ultralytics 8.4.x`** release (`Settings v0.0.8` vs `v0.0.6` / `8.4.4`), which updated `compute_ap` PR-curve integration at the deployment confidence threshold and shifts reported mAP downward compared to earlier runs.
+> - **YOLO FP16 Builds**: Compiled cleanly via `scripts/build_engine.py` into compact FP16 engines (`6.8 / 20.4 / 108.8 MB` vs `52.0 / 109.0 / 460.3 MB` in the legacy T4 table above), resulting in substantially faster YOLO T4 execution.
+>
+> Accordingly, **a strict 1:1 comparison between this table and earlier sections may not be accurate**; evaluate relative speed and accuracy across the 9 models within this single controlled run.
+
+| Model Name | Backend / Precision | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | Post (ms) | E2E (ms) | P95 (ms) | Throughput (FPS) |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **UNINA-QAT-INT8** | TensorRT (GPU) [INT8 QAT] | **19.9** | **87.3%** | **62.2%** | **2.52** | 0.57 | **3.58** | **4.09** | **279.6** |
+| **UNINA-QAT-FP16** | TensorRT (GPU) [Clean FP16] | 38.5 | 87.5% | 62.0% | 4.25 | 0.59 | 5.34 | 5.53 | 187.4 |
+| **UNINA-Sparse-FP16** | TensorRT (GPU) [FP16] | 38.5 | **87.7%** | 61.8% | 4.26 | 0.55 | 5.30 | 5.48 | 188.8 |
+| **YOLO26S-FP16** | TensorRT (GPU) [FP16] | 20.4 | 84.1% | 58.2% | 2.75 | 0.40 | 3.64 | 3.75 | 275.0 |
+| **YOLO26S-INT8** | TensorRT (GPU) [INT8 PTQ] | 13.0 | 70.6% | 45.3% | 1.91 | 0.40 | 2.79 | 2.89 | 358.7 |
+| **YOLO26N-FP16** | TensorRT (GPU) [FP16] | 6.8 | 78.7% | 52.2% | 1.78 | 0.40 | 2.66 | 3.68 | 376.1 |
+| **YOLO26N-INT8** | TensorRT (GPU) [INT8 PTQ] | 5.9 | 76.6% | 49.6% | 1.70 | 0.42 | 2.62 | 3.84 | 382.0 |
+| **YOLO26X-FP16** | TensorRT (GPU) [FP16] | 108.8 | 89.3% | 63.0% | 12.84 | 0.42 | 13.76 | 14.02 | 72.7 |
+| **YOLO26X-INT8** | TensorRT (GPU) [INT8 PTQ] | 60.6 | 83.8% | 52.5% | 7.50 | 0.44 | 8.45 | 8.69 | 118.4 |
+
+> [!NOTE]
+> - **QAT Quantization Fidelity vs. PTQ Degradation**: Compared to `UNINA-QAT-FP16`, `UNINA-QAT-INT8` loses only **-0.2 pp mAP50** (`87.3%` vs `87.5%`) and **0.0 pp loss in mAP50-95** (`62.2%` vs `62.0%`) while reducing engine footprint by **48.3%** (`19.9 MB` vs `38.5 MB`) and cutting inference latency by **1.69x** (`2.52 ms` vs `4.25 ms`, `279.6` vs `187.4` FPS). By contrast, Ultralytics INT8 PTQ degrades `YOLO26S` by **-13.5 pp mAP50 / -12.9 pp mAP50-95**, `YOLO26X` by **-5.5 pp mAP50 / -10.5 pp mAP50-95**, and `YOLO26N` by **-2.1 pp mAP50 / -2.6 pp mAP50-95**.
+> - **Pareto Advantage on T4**: `UNINA-QAT-INT8` outperforms both `YOLO26S-FP16` (**+3.2 pp** mAP50, **+4.0 pp** mAP50-95, `279.6` vs `275.0` FPS) and `YOLO26X-INT8` (**+3.5 pp** mAP50, **+9.7 pp** mAP50-95 at **2.36x** higher FPS), and runs **3.85x** faster than `YOLO26X-FP16` while staying within 2.0 pp mAP50 (`0.8 pp` mAP50-95).
+> - **Note on T4 Sparsity**: Tesla T4 (Turing `sm_75`) lacks Ampere/Blackwell 2:4 sparse Tensor Cores, so `UNINA-Sparse-FP16` executes as dense FP16 on T4 (`4.26 ms`).
+
 ### PyTorch Eager Runtime (Tesla T4)
 
 | Model | Format | Params | GFLOPs | Size (MB) | mAP50 | mAP50-95 | Infer (ms) | Post (ms) | E2E (ms) | FPS |
@@ -232,4 +301,23 @@ Accuracy evaluated across the four Formula Student cone categories:
 | **TensorRT Latency (RTX 6000)** | **0.51 ms** | 0.55 ms | +0.04 ms |
 | **Recommendation** | **Production Champion** | Experimental Archive | Gen 2.5 preferred |
 **Conclusion**: Gen 2.5 achieves equivalent or higher accuracy with lower parameter count, lower FLOPs, faster TensorRT execution, and better INT8 quantization stability. Gen 2.5 is therefore selected as the primary architecture.
+
+---
+
+## 6. Post-Training PyTorch Test-Split Evaluation (Gen 3.2 Standalone QAT, 150 + 30 + 15)
+
+In addition to the batch-1 TensorRT validation benchmarks above (`1,157` val images), a **Generation 3.2** model (`--version 3.2`, `--upsample_mode deconv`, `--pretrained_backbone`, `--enable_sparsity`, `--enable_qat`, `--formula_image`, standalone without `--enable_distillation`) trained across the full **150 + 30 + 15** epoch schedule (`--o2m_aux_weight_end 0.15`, `--o2o_topk_stage1_pct 0.25`, `--o2o_topk_stage2_pct 0.45`) was evaluated in PyTorch Phase 4 on the held-out FSOCO **test split (`1,158` images)** at shape `(16, 3, 480, 768)` and `conf>0.001`:
+
+- **Predictions (`conf>0.001`)**: `40,117`
+- **Speed (batch 16)**: `0.0 ms` preprocess, `2.7 ms` inference, `0.2 ms` postprocess per image
+- **Mean Test Accuracy (`conf>0.001`)**: **90.0% mAP50** / **66.0% mAP50-95** (vs Gen 2.6 150-epoch test evaluation under the same protocol: `79.29%` mAP50 / `53.03%` mAP50-95)
+
+| Class | Category Name | Test AP50 (`conf>0.001`) | Test AP50-95 (`conf>0.001`) |
+| :--- | :--- | :---: | :---: |
+| `class0` | `yellow_cone` | **91.6%** | **64.8%** |
+| `class1` | `blue_cone` | **90.4%** | **64.8%** |
+| `class2` | `small_orange_cone` | **89.9%** | **65.3%** |
+| `class3` | `large_orange_cone` | **88.1%** | **69.1%** |
+| **Mean** | **All Classes** | **90.0%** | **66.0%** |
+
 

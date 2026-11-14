@@ -112,6 +112,148 @@ def _maybe_embed_ultralytics_metadata(engine_path, args):
         return 2
 
 
+def _load_int8_scales(onnx_path, int8_scales_path=None):
+    """Locate and load <onnx_base>_int8_scales.json if available."""
+    import json
+
+    candidates = []
+    if int8_scales_path:
+        candidates.append(int8_scales_path)
+    base_no_ext = os.path.splitext(onnx_path)[0]
+    candidates.append(f"{base_no_ext}_int8_scales.json")
+    if base_no_ext.endswith("_qatclean"):
+        candidates.append(f"{base_no_ext[:-9]}_qat_int8_scales.json")
+
+    for path in candidates:
+        if path and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data:
+                    print(f"[INT8 Scales] Loaded {len(data)} QAT scale entries from: {path}")
+                    return data, path
+            except Exception as e:
+                print(f"[Warning] Failed to parse INT8 scales file '{path}': {e}")
+    return None, None
+
+
+def _write_trt_calib_cache_from_scales(scales_dict, onnx_path, cache_output_path):
+    """
+    Generate a TensorRT INT8 calibration cache file from QAT _int8_scales.json,
+    mapping ONNX tensor names to IEEE-754 hex scale factors (amax / 127.0).
+    """
+    import struct
+
+    # Collect activation input quantizer amax values by module prefix
+    prefix_to_amax = {}
+    for key, entry in scales_dict.items():
+        if not isinstance(entry, dict) or "amax" not in entry:
+            continue
+        amax_val = entry["amax"]
+        if isinstance(amax_val, list):
+            if not amax_val:
+                continue
+            amax_scalar = float(max(abs(float(x)) for x in amax_val))
+        else:
+            amax_scalar = abs(float(amax_val))
+        if amax_scalar <= 0.0:
+            continue
+
+        if "._input_quantizer._amax" in key:
+            mod_prefix = key.split("._input_quantizer._amax")[0]
+            prefix_to_amax[mod_prefix] = amax_scalar
+
+    if not prefix_to_amax:
+        return None
+
+    tensor_scales = {}
+    # Input image [0, 1] range -> amax = 1.0
+    tensor_scales["images"] = 1.0 / 127.0
+
+    # Map ONNX graph tensors to module prefixes when onnx is available
+    try:
+        import onnx
+
+        model = onnx.load(onnx_path, load_external_data=False)
+        for node in model.graph.node:
+            # PyTorch ONNX node names typically look like "/backbone/stem/rbr_reparam/Conv"
+            clean_name = node.name.lstrip("/").replace("/", ".")
+            matched_amax = None
+            for prefix, amax_val in prefix_to_amax.items():
+                if clean_name.startswith(prefix) or prefix in clean_name:
+                    matched_amax = amax_val
+                    break
+            if matched_amax is not None:
+                scale = max(matched_amax / 127.0, 1e-7)
+                for inp in node.input:
+                    if inp and inp not in tensor_scales:
+                        tensor_scales[inp] = scale
+                for out in node.output:
+                    if out and out not in tensor_scales:
+                        tensor_scales[out] = scale
+    except Exception:
+        pass
+
+    # Also write raw module prefix keys for fallback matching
+    for prefix, amax_val in prefix_to_amax.items():
+        scale = max(amax_val / 127.0, 1e-7)
+        tensor_scales.setdefault(prefix, scale)
+
+    lines = ["TRT-8600-EntropyCalibration2"]
+    for t_name, scale in tensor_scales.items():
+        hex_scale = f"{struct.unpack('>I', struct.pack('>f', float(scale)))[0]:08x}"
+        lines.append(f"{t_name}: {hex_scale}")
+
+    with open(cache_output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[INT8 Scales] Generated TensorRT calibration cache: {cache_output_path} ({len(tensor_scales)} tensors)")
+    return cache_output_path
+
+
+def _apply_int8_scales_to_trt_network(network, scales_dict):
+    """Apply QAT dynamic ranges directly to TensorRT INetworkDefinition tensors."""
+    if not scales_dict:
+        return 0
+    prefix_to_amax = {}
+    for key, entry in scales_dict.items():
+        if isinstance(entry, dict) and "amax" in entry and "._input_quantizer._amax" in key:
+            amax_val = entry["amax"]
+            amax_scalar = (
+                float(max(abs(float(x)) for x in amax_val))
+                if isinstance(amax_val, list)
+                else abs(float(amax_val))
+            )
+            if amax_scalar > 0:
+                mod_prefix = key.split("._input_quantizer._amax")[0]
+                prefix_to_amax[mod_prefix] = amax_scalar
+
+    if not prefix_to_amax:
+        return 0
+
+    applied = 0
+    for i in range(network.num_inputs):
+        inp = network.get_input(i)
+        if inp is not None and not inp.dynamic_range:
+            inp.set_dynamic_range(-1.0, 1.0)
+            applied += 1
+
+    for i in range(network.num_layers):
+        layer = network.get_layer(i)
+        clean_name = layer.name.lstrip("/").replace("/", ".")
+        matched_amax = None
+        for prefix, amax_val in prefix_to_amax.items():
+            if clean_name.startswith(prefix) or prefix in clean_name:
+                matched_amax = amax_val
+                break
+        if matched_amax is not None:
+            for j in range(layer.num_outputs):
+                out_t = layer.get_output(j)
+                if out_t is not None:
+                    out_t.set_dynamic_range(-matched_amax, matched_amax)
+                    applied += 1
+    return applied
+
+
 def _build_engine_via_python_api(
     onnx_path,
     output_path,
@@ -121,6 +263,7 @@ def _build_engine_via_python_api(
     target="gpu",
     dla_core=0,
     gpu_fallback=False,
+    scales_dict=None,
 ):
     """Fallback engine builder using the TensorRT Python API when trtexec is not available."""
     import os
@@ -183,6 +326,11 @@ def _build_engine_via_python_api(
             print(f"[TRT Parser Error] {parser.get_error(error_idx)}")
         return 1
 
+    if enable_int8 and scales_dict:
+        n_applied = _apply_int8_scales_to_trt_network(network, scales_dict)
+        if n_applied > 0:
+            print(f"[TRT Python API] Applied QAT dynamic ranges to {n_applied} network tensors.")
+
     print(f"[TRT Python API] Building and serializing engine -> {output_path}...")
     if hasattr(builder, "build_serialized_network"):
         plan = builder.build_serialized_network(network, config)
@@ -243,6 +391,18 @@ def build_engine(args):
     print(f"Precision: INT8={enable_int8}, FP16={enable_fp16}")
     print(f"Sparsity: {enable_sparsity}")
 
+    # Resolve INT8 QAT scales / calibration cache if INT8 is enabled
+    scales_dict = None
+    if enable_int8:
+        scales_dict, _ = _load_int8_scales(args.onnx, getattr(args, "int8_scales", None))
+        if not getattr(args, "calib", None) and scales_dict:
+            auto_calib_path = os.path.splitext(output_path)[0] + "_qat.calib"
+            generated_cache = _write_trt_calib_cache_from_scales(
+                scales_dict, args.onnx, auto_calib_path
+            )
+            if generated_cache:
+                args.calib = generated_cache
+
     # 3. Construct Command
     import shutil
     trtexec_bin = shutil.which("trtexec")
@@ -266,6 +426,7 @@ def build_engine(args):
             target=args.target,
             dla_core=args.dla_core,
             gpu_fallback=args.gpu_fallback,
+            scales_dict=scales_dict,
         )
         if ret == 0:
             meta_rc = _maybe_embed_ultralytics_metadata(output_path, args)
@@ -399,6 +560,7 @@ def build_engine(args):
             target=args.target,
             dla_core=args.dla_core,
             gpu_fallback=args.gpu_fallback,
+            scales_dict=scales_dict,
         )
         if ret == 0:
             meta_rc = _maybe_embed_ultralytics_metadata(output_path, args)
@@ -455,6 +617,12 @@ if __name__ == "__main__":
     parser.add_argument("--no_int8", action="store_true", help="Disable INT8 precision")
     parser.add_argument("--no_fp16", action="store_true", help="Disable FP16 precision")
     parser.add_argument("--calib", type=str, default=None, help="Path to INT8 calibration cache")
+    parser.add_argument(
+        "--int8_scales",
+        type=str,
+        default=None,
+        help="Optional path to exported QAT _int8_scales.json (auto-detected next to --onnx by default)",
+    )
     parser.add_argument(
         "--mem_pool_size",
         type=str,

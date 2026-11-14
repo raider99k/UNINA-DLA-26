@@ -33,7 +33,7 @@ def run_classic_training(args, device, data_cfg, train_loader, val_loader, write
     print(f"Dataset Class Count: {nc_data}")
 
     # Initialize Student
-    arch_version = getattr(args, "version", None) or "2.5"
+    arch_version = getattr(args, "version", None) or "3.2"
     up_mode = getattr(args, "upsample_mode", None)
     student = UNINA_DLA(num_classes=nc_data, deploy=False, version=arch_version, upsample_mode=up_mode).to(device)
     print(f"Student initialized with {nc_data} classes (YOLO26 Head, Gen-{arch_version}, upsample={student.upsample_mode}).")
@@ -65,7 +65,7 @@ def run_classic_training(args, device, data_cfg, train_loader, val_loader, write
     # Optimizer selection (AdamW, SGD, or MuSGD)
     opt_name = str(getattr(args, "optimizer", "MuSGD")).strip().lower()
     base_lr = float(getattr(args, "lr", 0.001 if opt_name == "adamw" else 0.01))
-    weight_decay = float(getattr(args, "weight_decay", 1e-4 if opt_name == "adamw" else 1e-5))
+    weight_decay = float(getattr(args, "weight_decay", 1e-4 if opt_name == "adamw" else 5e-4))
     backbone_lr_ratio = float(getattr(args, "backbone_lr_ratio", 1.0))
 
     if opt_name == "adamw":
@@ -93,7 +93,7 @@ def run_classic_training(args, device, data_cfg, train_loader, val_loader, write
             if hasattr(student.backbone, "stem"):
                 pretrained_params.extend(list(student.backbone.stem.parameters()))
             if hasattr(student.backbone, "stages"):
-                stage_limit = 4 if arch_version == "2.6" else 3
+                stage_limit = 4 if arch_version in ("2.6", "3.2") else 3
                 for stage in student.backbone.stages[:stage_limit]:
                     pretrained_params.extend(list(stage.parameters()))
 
@@ -139,8 +139,8 @@ def run_classic_training(args, device, data_cfg, train_loader, val_loader, write
                     "weight_decay": 0.0,
                 },
             ]
-            stages_str = "Stem + Stages 1-4 (100% Backbone)" if arch_version == "2.6" else "Stem + Stages 1-3"
-            scratch_str = "Neck + Heads" if arch_version == "2.6" else "Stage 4 + Neck + Heads"
+            stages_str = "Stem + Stages 1-4 (100% Backbone)" if arch_version in ("2.6", "3.2") else "Stem + Stages 1-3"
+            scratch_str = "Neck + Heads" if arch_version in ("2.6", "3.2") else "Stage 4 + Neck + Heads"
             print(
                 f"[Optimizer] Surgical Differential LR enabled:\n"
                 f"  - Pretrained Stages ({stages_str}): LR = {base_lr * backbone_lr_ratio:.6f} ({backbone_lr_ratio:.2f}x ratio)\n"
@@ -199,9 +199,14 @@ def run_classic_training(args, device, data_cfg, train_loader, val_loader, write
 
     # Training Loop
     best_ckpt = None
+    epochs_completed = 0
     for epoch in range(args.epochs):
         trainer.train_epoch(epoch, train_loader, prefix="classic")
         best_ckpt = trainer.run_validation(val_loader, epoch, prefix="classic")
+        epochs_completed += 1
+        if trainer.should_stop:
+            break
 
+    args._phase_epochs_completed = epochs_completed
     print(f"Phase 1 (Classic) Complete. Best Checkpoint: {best_ckpt}")
     return best_ckpt

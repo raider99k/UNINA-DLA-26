@@ -25,6 +25,7 @@ from ultralytics.nn.tasks import DetectionModel
 from ultralytics.utils import nms, ops
 
 from unina_dla.model.unina_dla import UNINA_DLA
+from unina_dla.utils.model_utils import strip_engine_metadata
 
 
 def _coerce_names(names: dict[int, str] | Iterable[str] | None, num_classes: int) -> dict[int, str]:
@@ -403,18 +404,7 @@ def build_ultralytics_metadata(
     return meta
 
 
-def _strip_existing_engine_metadata(raw: bytes) -> bytes:
-    """If engine already has Ultralytics metadata prefix, strip it."""
-    if len(raw) < 8:
-        return raw
-    meta_len = int.from_bytes(raw[:4], byteorder="little", signed=True)
-    if meta_len <= 0 or (4 + meta_len) >= len(raw):
-        return raw
-    try:
-        json.loads(raw[4 : 4 + meta_len].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return raw
-    return raw[4 + meta_len :]
+_strip_existing_engine_metadata = strip_engine_metadata
 
 
 def embed_metadata_in_engine(

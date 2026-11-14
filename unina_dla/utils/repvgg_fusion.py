@@ -97,13 +97,13 @@ def create_identity_kernel(channels: int, groups: int, kernel_size: int) -> torc
     return torch.from_numpy(kernel_value)
 
 
-def merge_repvgg_branches(conv_dense, bn_dense, conv1x1, bn1x1, identity_bn=None):
+def merge_repvgg_branches(conv_dense, bn_dense, conv1x1=None, bn1x1=None, identity_bn=None):
     """
     Merge all RepVGG branches into a single equivalent convolution.
 
     Args:
         conv_dense, bn_dense: Dense branch (3x3 or 1x1)
-        conv1x1, bn1x1: 1x1 branch
+        conv1x1, bn1x1: 1x1 branch (optional when kernel_size=1)
         identity_bn: BatchNorm from identity branch (optional)
 
     Returns:
@@ -114,15 +114,15 @@ def merge_repvgg_branches(conv_dense, bn_dense, conv1x1, bn1x1, identity_bn=None
     # 1. Get fused weights/bias for dense branch
     w_dense, b_dense = fuse_bn_into_conv(conv_dense, bn_dense)
 
-    # 2. Get fused weights/bias for 1x1 branch
-    w1, b1 = fuse_bn_into_conv(conv1x1, bn1x1)
-
-    # Pad 1x1 weight to match dense branch size
-    w1 = pad_1x1_to_nxn(w1, kernel_size)
-
-    # Initialize total weight/bias
-    w_final = w_dense + w1
-    b_final = b_dense + b1
+    # 2. Get fused weights/bias for 1x1 branch (if present)
+    if conv1x1 is not None and bn1x1 is not None:
+        w1, b1 = fuse_bn_into_conv(conv1x1, bn1x1)
+        w1 = pad_1x1_to_nxn(w1, kernel_size)
+        w_final = w_dense + w1
+        b_final = b_dense + b1
+    else:
+        w_final = w_dense.clone()
+        b_final = b_dense.clone()
 
     # 3. Handle Identity branch
     if identity_bn is not None:
@@ -132,7 +132,7 @@ def merge_repvgg_branches(conv_dense, bn_dense, conv1x1, bn1x1, identity_bn=None
 
         # Create identity kernel matching the dense branch size
         id_kernel = create_identity_kernel(channels, groups, kernel_size).to(
-            conv_dense.weight.device
+            device=conv_dense.weight.device, dtype=conv_dense.weight.dtype
         )
 
         mean = identity_bn.running_mean

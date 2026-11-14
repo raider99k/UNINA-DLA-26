@@ -83,6 +83,17 @@ class RepVGGBlock(nn.Module):
                 groups=groups,
             )
 
+        self._init_weights()
+
+    def _init_weights(self):
+        # Note: nn.Conv2d already initializes with kaiming_uniform_(a=sqrt(5), mode='fan_in'),
+        # which keeps per-branch variance at ~1/3 so the 3-branch sum (3x3 + 1x1 + identity)
+        # preserves unit variance across deep stacks even before BN running stats warm up.
+        for m in self.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1.0)
+                nn.init.constant_(m.bias, 0.0)
+
     def forward(self, inputs):
         if hasattr(self, "rbr_reparam"):
             return self.nonlinearity(self.rbr_reparam(inputs))
@@ -92,18 +103,22 @@ class RepVGGBlock(nn.Module):
         else:
             id_out = self.rbr_identity(inputs)
 
-        return self.nonlinearity(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out)
+        out_1x1 = self.rbr_1x1(inputs) if self.rbr_1x1 is not None else 0
+        return self.nonlinearity(self.rbr_dense(inputs) + out_1x1 + id_out)
 
     def switch_to_deploy(self):
         """Fuse branches into single conv for inference."""
         if hasattr(self, "rbr_reparam"):
             return
 
+        conv1x1 = self.rbr_1x1.conv if self.rbr_1x1 is not None else None
+        bn1x1 = self.rbr_1x1.bn if self.rbr_1x1 is not None else None
+
         kernel, bias = merge_repvgg_branches(
             self.rbr_dense.conv,
             self.rbr_dense.bn,
-            self.rbr_1x1.conv,
-            self.rbr_1x1.bn,
+            conv1x1,
+            bn1x1,
             self.rbr_identity,
         )
 
@@ -123,7 +138,8 @@ class RepVGGBlock(nn.Module):
 
         # Remove training branches to save memory
         self.__delattr__("rbr_dense")
-        self.__delattr__("rbr_1x1")
+        if hasattr(self, "rbr_1x1"):
+            self.__delattr__("rbr_1x1")
         if hasattr(self, "rbr_identity"):
             self.__delattr__("rbr_identity")
 

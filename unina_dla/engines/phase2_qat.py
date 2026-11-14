@@ -1,10 +1,13 @@
 import os
+from itertools import islice
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm import tqdm
 from ultralytics.data import build_dataloader
 from ultralytics.utils import DEFAULT_CFG, IterableSimpleNamespace
+from ultralytics.utils.torch_utils import ModelEMA
 
 from unina_dla.engines.trainer import UnifiedTrainer
 from unina_dla.model.losses.adapters import DualYOLO26LossAdapter
@@ -21,6 +24,7 @@ from unina_dla.utils.qat_utils import (
     enable_quantization,
     prepare_qat_model,
     replace_modules_with_quant,
+    sync_quant_device,
 )
 from unina_dla.utils.sparsity_utils import (
     create_zero_clamp_hook,
@@ -46,8 +50,114 @@ def _validate_dual_head_state_dict(state_dict, source_name):
         )
 
 
+def _iter_limited_loader(loader, num_batches, desc):
+    """Iterate at most `num_batches` batches from `loader` with an accurately bounded progress bar."""
+    limit = max(0, int(num_batches))
+    total = min(len(loader), limit) if hasattr(loader, "__len__") else limit
+    return tqdm(islice(loader, limit), total=total, desc=desc)
+
+
+def _compute_calib_amax(
+    models, method="percentile", percentile=99.99, desc="[QAT] Computing amax", device=None
+):
+    """Compute and load calibrated amax buffers across modules and restore device placement."""
+    if isinstance(models, nn.Module):
+        models = [models]
+
+    try:
+        from pytorch_quantization import calib
+    except ImportError:
+        calib = None
+
+    quant_modules = [
+        m
+        for root in models
+        if root is not None
+        for m in root.modules()
+        if getattr(m, "_calibrator", None) is not None or hasattr(m, "load_calib_amax")
+    ]
+    if not quant_modules:
+        return
+
+    compute_amax_fn = getattr(calib, "compute_amax", None) if calib is not None else None
+    max_calibrator_cls = getattr(calib, "MaxCalibrator", None) if calib is not None else None
+
+    for m in tqdm(quant_modules, desc=desc):
+        if compute_amax_fn is not None:
+            try:
+                compute_amax_fn(m, method=method, percentile=percentile)
+                continue
+            except Exception:
+                pass
+
+        if hasattr(m, "load_calib_amax"):
+            calibrator = getattr(m, "_calibrator", None)
+            try:
+                if max_calibrator_cls is not None and isinstance(calibrator, max_calibrator_cls):
+                    m.load_calib_amax()
+                elif calibrator is not None:
+                    try:
+                        m.load_calib_amax(method=method, percentile=percentile)
+                    except TypeError:
+                        m.load_calib_amax()
+                else:
+                    m.load_calib_amax()
+            except Exception:
+                pass
+
+    # load_calib_amax / HistogramCalibrator allocates `_amax` on CPU; re-align onto target device.
+    for root in models:
+        if root is not None:
+            sync_quant_device(root, device)
+
+
+def _calibrate_qat_models(student, val_loader, args, device, adapters=None):
+    """Run activation calibration with progress bars and enable fake-quantization."""
+    # IMPORTANT: keep shuffle=False to preserve rectangular batch grouping and avoid mixed HxW collation errors.
+    calib_batches = getattr(args, "calib_batches", 200)
+    print(f"[QAT] Calibrating quantizers (up to {calib_batches} batches)...")
+    calib_loader = build_dataloader(
+        val_loader.dataset, batch=args.batch, workers=4, shuffle=False
+    )
+
+    targets = [student] + ([adapters] if adapters is not None else [])
+    for mod in targets:
+        enable_calibration(mod)
+        mod.eval()
+
+    student.deploy = False
+    if hasattr(student, "head") and hasattr(student.head, "deploy"):
+        student.head.deploy = False
+
+    with torch.no_grad():
+        for batch in _iter_limited_loader(calib_loader, calib_batches, desc="[QAT] Calibration"):
+            imgs = batch["img"].to(device).float() / 255.0
+            if adapters is not None:
+                s_f = student.backbone(imgs)
+                s_n = student.neck(s_f)
+                for sf, ad in zip(s_n, adapters):
+                    ad(sf)
+                student.head(s_n)
+            else:
+                student(imgs)
+
+    # Compute and load calibrated amax into quantizers before enabling fake-quantization
+    _compute_calib_amax(targets, method="percentile", percentile=99.99, device=device)
+
+    for mod in targets:
+        enable_quantization(mod)
+        sync_quant_device(mod, device)
+
+    # Freeze BN
+    for m in student.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+
+    return calib_loader
+
+
 @torch.no_grad()
-def bn_reestimate(model, loader, device, num_batches=200):
+def bn_reestimate(model, loader, device, num_batches=200, force_calib=False):
     bn_modules = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
     if bn_modules:
         print(f"Re-estimating BN statistics for {len(bn_modules)} BatchNorm2d layers ({num_batches} batches)...")
@@ -57,45 +167,44 @@ def bn_reestimate(model, loader, device, num_batches=200):
             m.momentum = 0.1
             m.reset_running_stats()
 
-        count = 0
-        for batch in loader:
-            if count >= num_batches:
-                break
+        for batch in _iter_limited_loader(loader, num_batches, desc="[QAT] BN Re-estimation"):
             imgs = batch["img"].to(device).float() / 255.0
             model(imgs)
-            count += 1
         print("BN Re-estimation Complete.")
         return
 
-    # Fused Conv2d deployment architecture: calibrate activation quantizer modules
+    # Fused Conv2d deployment architecture: only calibrate quantizer modules if uncalibrated (or forced),
+    # preventing post-QAT bn_reestimate from wiping out QAT-trained amax scales.
     quant_modules = [
         m for m in model.modules()
         if hasattr(m, "_calibrator") or hasattr(m, "load_calib_amax") or hasattr(m, "enable_calib")
     ]
     if quant_modules:
+        uncalibrated = [
+            m
+            for m in quant_modules
+            if getattr(m, "_amax", None) is None
+            or (torch.is_tensor(m._amax) and m._amax.numel() == 0)
+        ]
+        if not uncalibrated and not force_calib:
+            enable_quantization(model)
+            sync_quant_device(model, device)
+            print(
+                f"[Calibration] {len(quant_modules)} quantizer modules already have calibrated amax buffers; preserving QAT scales."
+            )
+            return
+
         print(f"[Calibration] Calibrating {len(quant_modules)} activation quantizer modules ({num_batches} batches)...")
         enable_calibration(model)
         model.eval()
-        count = 0
-        for batch in loader:
-            if count >= num_batches:
-                break
+        for batch in _iter_limited_loader(loader, num_batches, desc="[QAT] Calibration"):
             imgs = batch["img"].to(device).float() / 255.0
             model(imgs)
-            count += 1
 
         # Compute and load calibrated amax into quantizers
-        try:
-            from pytorch_quantization import calib
-            calib.compute_amax(model, method="percentile", percentile=99.99)
-        except Exception:
-            for m in quant_modules:
-                if hasattr(m, "load_calib_amax"):
-                    try:
-                        m.load_calib_amax()
-                    except Exception:
-                        pass
+        _compute_calib_amax(model, method="percentile", percentile=99.99, device=device)
         enable_quantization(model)
+        sync_quant_device(model, device)
         print("[Calibration] Activation quantizer calibration complete.")
     else:
         print("[Calibration] No BatchNorm or calibrator modules present.")
@@ -218,49 +327,9 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
         adapters.to(device)
 
         # Calibration (DIRTY: Use Val)
-        # IMPORTANT: keep shuffle=False to preserve rectangular batch grouping and avoid mixed HxW collation errors.
-        calib_loader = build_dataloader(
-            val_loader.dataset, batch=args.batch, workers=4, shuffle=False
+        calib_loader = _calibrate_qat_models(
+            student, val_loader, args, device, adapters=adapters
         )
-        enable_calibration(student)
-        enable_calibration(adapters)
-        student.eval()
-        adapters.eval()
-        student.deploy = False
-        if hasattr(student, "head") and hasattr(student.head, "deploy"):
-            student.head.deploy = False
-
-        with torch.no_grad():
-            for i, batch in enumerate(calib_loader):
-                if i >= getattr(args, "calib_batches", 200):
-                    break
-                imgs = batch["img"].to(device).float() / 255.0
-                s_f = student.backbone(imgs)
-                s_n = student.neck(s_f)
-                for sf, ad in zip(s_n, adapters):
-                    ad(sf)
-                student.head(s_n)
-
-        # Compute and load calibrated amax into quantizers before enabling fake-quantization
-        try:
-            from pytorch_quantization import calib
-            calib.compute_amax(student, method="percentile", percentile=99.99)
-            calib.compute_amax(adapters, method="percentile", percentile=99.99)
-        except Exception:
-            for m in list(student.modules()) + list(adapters.modules()):
-                if hasattr(m, "load_calib_amax"):
-                    try:
-                        m.load_calib_amax()
-                    except Exception:
-                        pass
-
-        enable_quantization(student)
-        enable_quantization(adapters)
-
-        # Freeze BN
-        for m in student.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
 
         # Freeze adapters if pretrained
         if "adapters" in ckpt:
@@ -301,40 +370,8 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
         trainer.setup_distillation(adapters, loss_balancer, distill_losses)
 
     else:
-        # No distillation
-        # Calibration (Standard)
-        # IMPORTANT: keep shuffle=False to preserve rectangular batch grouping and avoid mixed HxW collation errors.
-        calib_loader = build_dataloader(
-            val_loader.dataset, batch=args.batch, workers=4, shuffle=False
-        )
-        enable_calibration(student)
-        student.eval()
-        student.deploy = False
-        if hasattr(student, "head") and hasattr(student.head, "deploy"):
-            student.head.deploy = False
-        with torch.no_grad():
-            for i, batch in enumerate(calib_loader):
-                if i >= getattr(args, "calib_batches", 200):
-                    break
-                imgs = batch["img"].to(device).float() / 255.0
-                student(imgs)
-
-        # Compute and load calibrated amax into quantizers before enabling fake-quantization
-        try:
-            from pytorch_quantization import calib
-            calib.compute_amax(student, method="percentile", percentile=99.99)
-        except Exception:
-            for m in student.modules():
-                if hasattr(m, "load_calib_amax"):
-                    try:
-                        m.load_calib_amax()
-                    except Exception:
-                        pass
-
-        enable_quantization(student)
-        for m in student.modules():
-            if isinstance(m, nn.BatchNorm2d):
-                m.eval()
+        # No distillation — Calibration (Standard)
+        calib_loader = _calibrate_qat_models(student, val_loader, args, device)
 
         optimizer = optim.AdamW(student.parameters(), lr=1e-5)
 
@@ -365,8 +402,9 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
         except Exception as e:
             print(f"[Warning] Could not fully restore O2M task loss state: {e}")
 
-    # QAT: No AMP, No Compile
-    trainer.set_optimizer(optimizer, scheduler, task_loss_fn, None, None)  # No EMA for QAT
+    # QAT: No AMP, No Compile; enable EMA after QAT calibration to smooth STE oscillation
+    ema = ModelEMA(student)
+    trainer.set_optimizer(optimizer, scheduler, task_loss_fn, None, ema)
     trainer.use_amp = False
 
     # Resume Logic for QAT
@@ -383,6 +421,10 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
         _validate_dual_head_state_dict(state_dict, resume_target)
 
         student.load_state_dict(state_dict, strict=False)
+        sync_quant_device(student, device)
+        if "ema" in ckpt and ema is not None:
+            ema.ema.load_state_dict(ckpt["ema"], strict=False)
+            sync_quant_device(ema.ema, device)
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:
@@ -396,14 +438,31 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
                 task_loss_fn.o2m_loss_fn.load_state_dict(ckpt["task_loss_o2m"], strict=False)
             except Exception as e:
                 print(f"[Warning] Could not fully restore O2M task loss state: {e}")
+        if "map" in ckpt:
+            trainer.best_map = ckpt["map"]
+        if "early_stopping" in ckpt:
+            trainer.load_early_stopping_state(ckpt["early_stopping"])
 
         print(f"Resumed QAT from Epoch {start_epoch}")
 
     # Loop
-    best_ckpt = None
-    for epoch in range(start_epoch, args.epochs_qat):
-        trainer.train_epoch(epoch, train_loader, prefix="qat")
-        best_ckpt = trainer.run_validation(val_loader, epoch, prefix="qat")
+    best_ckpt = (
+        trainer.get_best_checkpoint_path()
+        if os.path.isfile(trainer.get_best_checkpoint_path())
+        else None
+    )
+    epochs_completed = 0
+    if not trainer.should_stop:
+        for epoch in range(start_epoch, args.epochs_qat):
+            trainer.train_epoch(epoch, train_loader, prefix="qat")
+            best_ckpt = trainer.run_validation(val_loader, epoch, prefix="qat")
+            epochs_completed += 1
+            if trainer.should_stop:
+                break
+    else:
+        print("[EarlyStopping] Resumed QAT checkpoint already reached stopping criterion.")
+
+    args._phase_epochs_completed = epochs_completed
 
     # Final BN re-estimation on best checkpoint
     if best_ckpt and os.path.exists(best_ckpt):
@@ -416,6 +475,7 @@ def run_qat(args, device, data_cfg, train_loader, val_loader, distill_ckpt, writ
         )
         _validate_dual_head_state_dict(state_dict, best_ckpt)
         student.load_state_dict(state_dict, strict=False)
+        sync_quant_device(student, device)
 
         # Reuse calib_loader (kept non-shuffled for rectangular-shape safety)
         bn_batches = getattr(args, "bn_batches", 200)

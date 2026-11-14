@@ -23,7 +23,7 @@ from unina_dla.benchmark.config import ModelSpec
 from unina_dla.model.unina_dla import UNINA_DLA, detect_architecture_version, detect_upsample_mode
 from unina_dla.utils.box_ops import decode_bboxes, non_max_suppression
 from unina_dla.utils.metrics import UNINAMetrics
-from unina_dla.utils.model_utils import model_summary
+from unina_dla.utils.model_utils import model_summary, strip_engine_metadata
 
 _ANCHOR_CACHE: Dict[Tuple[Tuple[Tuple[int, int], ...], str], Tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -445,7 +445,7 @@ class UNINAPyTorchAdapter(BaseModelAdapter):
             if is_qat:
                 try:
                     from unina_dla.utils.qat_utils import enable_quantization
-                    enable_quantization(model)
+                    enable_quantization(model, device=self.device)
                 except Exception:
                     pass
 
@@ -817,8 +817,16 @@ class TensorRTAdapter(BaseModelAdapter):
             import tensorrt as trt
 
             self.trt_logger = trt.Logger(trt.Logger.WARNING)
-            with open(self.path, "rb") as f, trt.Runtime(self.trt_logger) as runtime:
-                self.engine = runtime.deserialize_cuda_engine(f.read())
+            with open(self.path, "rb") as f:
+                raw_bytes = f.read()
+            engine_bytes = strip_engine_metadata(raw_bytes)
+            if len(engine_bytes) != len(raw_bytes):
+                stripped = len(raw_bytes) - len(engine_bytes)
+                print(f"[TensorRT] Stripped {stripped}-byte Ultralytics metadata header from {self.path.name}")
+            with trt.Runtime(self.trt_logger) as runtime:
+                self.engine = runtime.deserialize_cuda_engine(engine_bytes)
+            if self.engine is None:
+                raise RuntimeError("deserialize_cuda_engine returned None (check TensorRT version/GPU match).")
             self.context = self.engine.create_execution_context()
             self.is_raw_trt = True
 
@@ -996,7 +1004,11 @@ class TensorRTAdapter(BaseModelAdapter):
                 from ultralytics.utils import nms as ultra_nms
 
                 p = raw_preds[0]
-                if p.shape[-1] != 4 + self.num_classes and p.shape[1] == 4 + self.num_classes:
+                if (
+                    p.shape[-1] != 6
+                    and p.shape[-1] == 4 + self.num_classes
+                    and p.shape[1] != 4 + self.num_classes
+                ):
                     p = p.transpose(1, 2)
                 return ultra_nms.non_max_suppression(
                     p, conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det

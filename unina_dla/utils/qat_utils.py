@@ -114,6 +114,8 @@ def prepare_qat_model(
     if quant_nn is None or QuantDescriptor is None:
         raise ImportError("pytorch_quantization is not installed. Cannot perform QAT.")
 
+    target_device = _infer_model_device(model)
+
     # 0. Set default ignore list if None (preds heads and bilinear deconvolution upsampling)
     if ignore_modules is None:
         ignore_modules = ["preds", "upsample"]
@@ -218,6 +220,7 @@ def prepare_qat_model(
     # 5. Replace modules
     print(f"Replacing modules with QuantConv2d (Ignoring: {ignore_modules})...")
     replace_modules_with_quant(model, ignore_modules=ignore_modules)
+    sync_quant_device(model, target_device)
 
     return model
 
@@ -248,6 +251,7 @@ def replace_modules_with_quant(module, parent_name="", ignore_modules=None):
 
         if isinstance(child, nn.Conv2d):
             print(f"[QAT] Quantizing: {full_name}")
+            child_device = child.weight.device
             new_module = quant_nn.QuantConv2d(
                 child.in_channels,
                 child.out_channels,
@@ -257,13 +261,14 @@ def replace_modules_with_quant(module, parent_name="", ignore_modules=None):
                 child.dilation,
                 child.groups,
                 child.bias is not None,
-            )
+            ).to(child_device)
             new_module.weight.data = child.weight.data
             if child.bias is not None:
                 new_module.bias.data = child.bias.data
             setattr(module, name, new_module)
         elif isinstance(child, nn.ConvTranspose2d):
             print(f"[QAT] Quantizing Deconv: {full_name}")
+            child_device = child.weight.device
             # Use PatchedQuantConvTranspose2d to fix PyTorch >= 1.12 compatibility
             new_module = PatchedQuantConvTranspose2d(
                 child.in_channels,
@@ -275,34 +280,100 @@ def replace_modules_with_quant(module, parent_name="", ignore_modules=None):
                 child.groups,
                 child.bias is not None,
                 child.dilation,
-            )
+            ).to(child_device)
             new_module._quant_conv_transpose.weight.data = child.weight.data
             if child.bias is not None:
                 new_module._quant_conv_transpose.bias.data = child.bias.data
             setattr(module, name, new_module)
         # Recurse for other modules (containers etc)
         else:
+            if hasattr(child, "shared_quantizer") and getattr(child, "shared_quantizer", None) is None:
+                quant_desc = getattr(quant_nn.QuantConv2d, "default_quant_desc_input", None)
+                sq = (
+                    quant_nn.TensorQuantizer(quant_desc)
+                    if quant_desc is not None
+                    else quant_nn.TensorQuantizer()
+                )
+                child_device = _infer_model_device(child)
+                child.shared_quantizer = sq.to(child_device) if child_device is not None else sq
+                print(f"[QAT] Attached shared_quantizer to Concat-invariant module: {full_name}")
             replace_modules_with_quant(child, full_name, ignore_modules=ignore_modules)
+
+
+def _infer_model_device(model):
+    """Return the device of a model's first parameter or buffer, or None."""
+    if model is None:
+        return None
+    for p in model.parameters():
+        return p.device
+    for b in model.buffers():
+        return b.device
+    return None
+
+
+def sync_quant_device(model, device=None):
+    """Move model parameters, buffers, and quantizer `_amax` tensors onto the target device."""
+    if model is None:
+        return model
+    target_device = torch.device(device) if device is not None else _infer_model_device(model)
+    if target_device is None:
+        return model
+
+    model.to(target_device)
+    for mod in model.modules():
+        amax = getattr(mod, "_amax", None)
+        if torch.is_tensor(amax) and amax.device != target_device:
+            buffers = getattr(mod, "_buffers", None)
+            if isinstance(buffers, dict) and "_amax" in buffers:
+                buffers["_amax"] = amax.to(target_device)
+            else:
+                mod._amax = amax.to(target_device)
+    return model
 
 
 def enable_calibration(model):
     """Enable calibration mode for all quantized modules."""
     if quant_nn is None:
         return
+    model._quant_observers_frozen = False
     for name, module in model.named_modules():
         if isinstance(module, quant_nn.TensorQuantizer):
             module.enable_calib()
             module.disable_quant()
 
 
-def enable_quantization(model):
-    """Enable proper quantization (disable calibration)."""
-    if quant_nn is None:
+def enable_quantization(model, device=None):
+    """Enable proper quantization (disable calibration) and align quantizer device."""
+    if quant_nn is not None:
+        model._quant_observers_frozen = False
+        for name, module in model.named_modules():
+            if isinstance(module, quant_nn.TensorQuantizer):
+                module.disable_calib()
+                module.enable_quant()
+    sync_quant_device(model, device)
+
+
+@torch.no_grad()
+def update_weight_quantizers(model):
+    """
+    Dynamically update per-channel/per-tensor weight quantizer amax buffers to track
+    weight evolution during QAT fine-tuning until freeze_quantization_observers() is called.
+    """
+    if getattr(model, "_quant_observers_frozen", False):
         return
-    for name, module in model.named_modules():
-        if isinstance(module, quant_nn.TensorQuantizer):
-            module.disable_calib()
-            module.enable_quant()
+    for module in model.modules():
+        wq = getattr(module, "_weight_quantizer", None)
+        w = getattr(module, "weight", None)
+        if wq is not None and w is not None and torch.is_tensor(w):
+            amax = getattr(wq, "_amax", None)
+            if amax is not None and torch.is_tensor(amax) and amax.numel() > 0:
+                w_abs = w.detach().abs()
+                if amax.ndim == 0 or amax.numel() == 1:
+                    new_amax = w_abs.max().reshape_as(amax)
+                else:
+                    reduce_dims = tuple(range(1, w_abs.ndim))
+                    new_amax = w_abs.amax(dim=reduce_dims).reshape_as(amax)
+                amax.copy_(new_amax.clamp(min=1e-7).to(device=amax.device, dtype=amax.dtype))
 
 
 def freeze_quantization_observers(model):
@@ -313,6 +384,7 @@ def freeze_quantization_observers(model):
     The weights can still update, but the scale factors (S) are locked.
     This prevents "scale jitter" in the final epochs and helps the loss converge.
     """
+    model._quant_observers_frozen = True
     if quant_nn is None:
         return
     frozen_count = 0
@@ -322,3 +394,4 @@ def freeze_quantization_observers(model):
             module.enable_quant()  # Keeps applying fake-quantization
             frozen_count += 1
     print(f"[QAT] Froze {frozen_count} quantizer observers (Oscillation Dampening).")
+

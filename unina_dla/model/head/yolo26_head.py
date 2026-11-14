@@ -14,10 +14,11 @@ class YOLO26Head(nn.Module):
     - O2M branch: auxiliary training branch (never exported)
     """
 
-    def __init__(self, num_classes=4, in_channels=[256, 192, 128], deploy=False):
+    def __init__(self, num_classes=4, in_channels=[256, 192, 128], deploy=False, reg_relu=True):
         super(YOLO26Head, self).__init__()
         self.num_classes = num_classes
         self.deploy = deploy
+        self.reg_relu = bool(reg_relu)
         self.reg_max = 0  # direct regression, no DFL
 
         # Explicit strides for P3/P4/P5
@@ -78,7 +79,7 @@ class YOLO26Head(nn.Module):
             self.o2o_reg_preds.append(
                 nn.Sequential(
                     nn.Conv2d(ch, 4, 1),
-                    nn.ReLU(),
+                    nn.ReLU() if self.reg_relu else nn.Identity(),
                 )
             )
 
@@ -87,7 +88,7 @@ class YOLO26Head(nn.Module):
             self.o2m_reg_preds.append(
                 nn.Sequential(
                     nn.Conv2d(ch, 4, 1),
-                    nn.ReLU(),
+                    nn.ReLU() if self.reg_relu else nn.Identity(),
                 )
             )
 
@@ -107,21 +108,27 @@ class YOLO26Head(nn.Module):
                     nn.init.constant_(m.bias, 0)
 
         # RetinaNet negative prior bias: b = -log((1 - pi) / pi) for pi = 0.01 (pi ~= 1%)
-        # Prevents initial BCE loss explosion on 8400 mostly-background anchors
+        # Prevents initial BCE loss explosion on 8400 mostly-background anchors.
+        # Final 1x1 projection heads have out_channels=4, where kaiming fan_out gives std=sqrt(2/4)=0.707
+        # (producing logit std ~11.3 across 256 channels and swamping the prior bias). Use std=0.01.
         prior_prob = 0.01
         cls_bias_init = float(-math.log((1.0 - prior_prob) / prior_prob))
         for branch in self.o2o_cls_preds:
+            nn.init.normal_(branch.weight, mean=0.0, std=0.01)
             if hasattr(branch, "bias") and branch.bias is not None:
                 nn.init.constant_(branch.bias, cls_bias_init)
         for branch in self.o2m_cls_preds:
+            nn.init.normal_(branch.weight, mean=0.0, std=0.01)
             if hasattr(branch, "bias") and branch.bias is not None:
                 nn.init.constant_(branch.bias, cls_bias_init)
 
-        # P3/P4/P5 priors for distance-based LTRB regression
-        scale_biases = [2.0, 4.0, 4.0]
+        # P3/P4/P5 priors for distance-based LTRB regression (1.0 on P3 = 16x16 px cone prior for Gen 3.2)
+        scale_biases = [2.0, 4.0, 4.0] if self.reg_relu else [1.0, 2.0, 2.0]
         for branch, bias in zip(self.o2o_reg_preds, scale_biases):
+            nn.init.normal_(branch[0].weight, mean=0.0, std=0.01)
             nn.init.constant_(branch[0].bias, bias)
         for branch, bias in zip(self.o2m_reg_preds, scale_biases):
+            nn.init.normal_(branch[0].weight, mean=0.0, std=0.01)
             nn.init.constant_(branch[0].bias, bias)
 
     def forward(self, feats):

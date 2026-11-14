@@ -281,11 +281,9 @@ def validate(
                         d = torch.cat(
                             [pred_boxes[i][mask], conf[i][mask], j[i][mask].float()], dim=-1
                         )
-                        # Keep NMS-free behavior while matching standard detector cap.
-                        # This avoids metric bias from unbounded low-quality tail predictions.
-                        if d.shape[0] > max_det:
-                            keep = d[:, 4].argsort(descending=True)[:max_det]
-                            d = d[keep]
+                        # Always sort by confidence descending and cap at max_det
+                        keep = d[:, 4].argsort(descending=True)[:max_det]
+                        d = d[keep]
                         dets.append(d)
                     else:
                         dets.append(torch.zeros((0, 6), device=device))

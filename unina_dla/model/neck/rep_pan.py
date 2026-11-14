@@ -22,17 +22,18 @@ class DLAUpsample(nn.Module):
             self.upsample.weight.copy_(self.get_bilinear_kernel(scale))
 
     def get_bilinear_kernel(self, scale):
-        """Generate a diagonal bilinear kernel for channel-preserving ConvTranspose2d."""
-        factor = (scale + 1) // 2
-        if scale % 2 == 1:
-            center = factor - 1
-        else:
-            center = factor - 0.5
-        og = torch.meshgrid(torch.arange(scale), torch.arange(scale), indexing="ij")
-        filt = (1 - torch.abs(og[0] - center) / factor) * (1 - torch.abs(og[1] - center) / factor)
+        """
+        Generate an amplitude-preserving diagonal kernel for ConvTranspose2d(kernel_size=scale, stride=scale).
+        Because kernel_size == stride with zero padding (required for strict DLA 2.0 residency),
+        output tiles are non-overlapping: each output pixel receives signal from exactly one input pixel.
+        Initializing each kH x kW spatial entry on the channel diagonal to 1.0 preserves exact 1.0x
+        feature amplitude at step 0 (preventing the 4x signal attenuation of overlapping bilinear formulas)
+        while allowing all 4 sub-pixel quadrants and cross-channel weights to be learned during training.
+        """
+        filt = torch.ones((scale, scale), dtype=torch.float32)
 
         # ConvTranspose2d stores weights as [in_channels, out_channels / groups, kH, kW].
-        # Filling only the diagonal preserves per-channel bilinear behavior at initialization
+        # Filling only the diagonal preserves per-channel identity behavior at initialization
         # while keeping groups=1 for DLA compatibility.
         weight = torch.zeros((self.upsample.in_channels, self.upsample.out_channels, scale, scale))
         for i in range(min(self.upsample.in_channels, self.upsample.out_channels)):
