@@ -14,15 +14,16 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
+
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.utils import DEFAULT_CFG, IterableSimpleNamespace
 
+from unina_dla.engines.common import validate_dual_head_state_dict
 from unina_dla.engines.phase1_5_sparsity import run_sparsity_finetune
 from unina_dla.engines.phase1_classic import run_classic_training
 from unina_dla.engines.phase1_distill import run_distillation
 from unina_dla.engines.phase2_qat import run_qat
 from unina_dla.engines.phase3_export import run_export
-
 
 AUGMENTATION_KEYS = (
     "hsv_h",
@@ -586,35 +587,23 @@ def main():
 
     if args.epochs_sparsity is None:
         args.epochs_sparsity = calculate_finetune_epochs(args.epochs, pct=0.10)
-        print(
-            f"[Dynamic Epochs] Sparsity set to {args.epochs_sparsity} epochs (10% of {args.epochs})"
-        )
+        if args.enable_sparsity and not args.skip_sparsity:
+            print(
+                f"[Dynamic Epochs] Sparsity set to {args.epochs_sparsity} epochs (10% of {args.epochs})"
+            )
     else:
         args.epochs_sparsity = max(1, int(args.epochs_sparsity))
 
     if args.epochs_qat is None:
         args.epochs_qat = calculate_finetune_epochs(args.epochs, pct=0.05)
-        print(f"[Dynamic Epochs] QAT set to {args.epochs_qat} epochs (5% of {args.epochs})")
+        if args.enable_qat:
+            print(f"[Dynamic Epochs] QAT set to {args.epochs_qat} epochs (5% of {args.epochs})")
     else:
         args.epochs_qat = max(1, int(args.epochs_qat))
 
     def validate_dual_head_checkpoint(path):
         ckpt_local = torch.load(path, map_location="cpu")
-        model_sd = (
-            ckpt_local["model"]
-            if isinstance(ckpt_local, dict) and "model" in ckpt_local
-            else ckpt_local
-        )
-        required = (
-            "head.o2o_reg_preds.0.0.weight",
-            "head.o2m_reg_preds.0.0.weight",
-        )
-        missing = [k for k in required if k not in model_sd]
-        if missing:
-            raise ValueError(
-                f"Checkpoint '{path}' is pre-dual-head and incompatible with this training pipeline. "
-                "Retrain from scratch or provide a dual-head checkpoint."
-            )
+        validate_dual_head_state_dict(ckpt_local, path)
 
     # Experiment Setup
     # Construct final output path (handles both absolute and relative paths)
@@ -903,6 +892,7 @@ def main():
         current_ckpt = os.path.join(args.output_dir, "best_classic.pth")
         args.checkpoint = current_ckpt
 
+    args.num_classes = data_cfg_dict.get("nc", 4)
     _best_exported_onnx = run_export(args)
 
     # ---------------------------------------------------------
@@ -933,12 +923,7 @@ def main():
                 test_set, batch=args.batch, workers=args.workers, shuffle=False
             )
 
-            # Load Best Available Model (Prioritize ONNX for speed/verification, else PyTorch)
-            # Actually Validator works best with PyTorch model wrapper or ONNX Runtime.
-            # Our custom validator works with PyTorch model wrapper.
-            # Let's use the best PyTorch checkpoint to ensure compatibility with our custom validator/metrics code.
-            # (Export verifiers can run elsewhere).
-
+            # Evaluate best PyTorch checkpoint using the custom validator/metrics pipeline.
             final_ckpt = (
                 qat_ckpt
                 if args.enable_qat
@@ -990,20 +975,30 @@ def main():
             use_nms = True if args.classic else None
 
             # Lineage-based Prefixing
-            lineage_prefix = "classic_" if args.classic else "distilled_"
+            lineage_prefix = (
+                "classic_"
+                if args.classic
+                else ("distilled_" if args.enable_distillation else "standalone_")
+            )
             if args.enable_sparsity:
                 lineage_prefix += "sparse_"
             if args.enable_qat:
                 lineage_prefix += "qat_"
 
             test_prefix = f"{lineage_prefix}TEST_"
+            raw_names = data_cfg_dict.get("names", {})
+            test_names = (
+                {i: n for i, n in enumerate(raw_names)}
+                if isinstance(raw_names, (list, tuple))
+                else (raw_names or {})
+            )
 
             results, _ = validate(
                 test_model,
                 test_loader,
                 device=device,
                 num_classes=num_classes,
-                names=data_cfg.get("names", {}),
+                names=test_names,
                 save_dir=args.output_dir,
                 prefix=test_prefix,
                 nms=use_nms,
@@ -1025,7 +1020,7 @@ def main():
                 conf_thres=deploy_conf,
                 iou_thres=deploy_iou,
                 num_classes=num_classes,
-                names=data_cfg.get("names", {}),
+                names=test_names,
                 save_dir=None,
                 prefix=f"{test_prefix}deploy_",
                 nms=use_nms,

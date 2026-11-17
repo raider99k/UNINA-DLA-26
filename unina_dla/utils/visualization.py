@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw
 from unina_dla.utils.box_ops import decode_bboxes
 
 
-def save_batch_image(batch, filename, names):
+def save_batch_image(batch, filename, names, printer=print):
     """Save a batch of images with ground truth boxes for inspection."""
     imgs = batch["img"].numpy()  # [B, 3, H, W]
 
@@ -60,11 +60,19 @@ def save_batch_image(batch, filename, names):
         draw.text((x1, y1 - 10), label, fill=color)
 
     img_pil.save(filename)
-    print(f"Batch inspection image saved to {filename}")
+    printer(f"Batch inspection image saved to {filename}")
 
 
 def save_val_predictions(
-    model, dataloader, device, names, save_dir, num_samples=4, conf_thres=0.25, prefix=""
+    model,
+    dataloader,
+    device,
+    names,
+    save_dir,
+    num_samples=4,
+    conf_thres=0.25,
+    prefix="",
+    verbose=False,
 ):
     """
     Save sample validation images with GT boxes (green) and predictions (blue).
@@ -73,6 +81,7 @@ def save_val_predictions(
     model.eval()
     saved = 0
     strides = [8, 16, 32]
+    file_prefix = f"{prefix}_" if prefix and not prefix.endswith("_") else prefix
 
     for batch in dataloader:
         if saved >= num_samples:
@@ -88,7 +97,11 @@ def save_val_predictions(
             if isinstance(preds, tuple) and len(preds) == 6:
                 preds_reg, preds_cls = preds[:3], preds[3:]
                 is_deployed = True  # Already Sigmoided in model.forward()
-            elif len(preds) == 2:
+            elif isinstance(preds, tuple) and len(preds) == 5:
+                preds_reg, preds_cls, _, _, _ = preds
+            elif isinstance(preds, tuple) and len(preds) == 3:
+                preds_reg, preds_cls, _ = preds
+            elif isinstance(preds, (tuple, list)) and len(preds) == 2:
                 preds_reg, preds_cls = preds
             else:
                 continue
@@ -185,9 +198,10 @@ def save_val_predictions(
                 draw.text((x1, y2), f"{label}:{c:.2f}", fill=(0, 0, 255))
 
         # Save
-        save_path = os.path.join(save_dir, f"{prefix}val_predictions_{saved}.jpg")
+        save_path = os.path.join(save_dir, f"{file_prefix}val_predictions_{saved}.jpg")
         img_pil.save(save_path)
-        print(f"Validation prediction saved to {save_path}")
+        if verbose:
+            print(f"Validation prediction saved to {save_path}")
         saved += 1
 
     return saved
@@ -199,6 +213,8 @@ def plot_results(metrics, save_dir, prefix, title="Training Metrics"):
     Separately plots Adaptive Weights if available.
     """
     epochs = range(1, len(metrics["loss"]) + 1)
+    clean_prefix = prefix.rstrip("_")
+    saved_files = []
 
     # 1. Main Results Plot (Loss + mAP)
     fig, axes = plt.subplots(2, 1, figsize=(10, 10), sharex=True)
@@ -236,11 +252,11 @@ def plot_results(metrics, save_dir, prefix, title="Training Metrics"):
     ax_map.grid(True, which="both", ls="--", alpha=0.4)
     ax_map.legend(loc="lower right")
 
-    filename_main = os.path.join(save_dir, f"results_{prefix}.png")
+    filename_main = os.path.join(save_dir, f"results_{clean_prefix}.png")
     plt.tight_layout()
     plt.savefig(filename_main, dpi=300, bbox_inches="tight")
     plt.close()
-    print(f"Main results plot saved to {filename_main}")
+    saved_files.append(os.path.basename(filename_main))
 
     # 2. Adaptive Weights Plot (Separate File)
     if "weights" in metrics and len(metrics["weights"]) > 0:
@@ -269,11 +285,11 @@ def plot_results(metrics, save_dir, prefix, title="Training Metrics"):
         ax_w.grid(True, which="both", ls="--", alpha=0.4)
         ax_w.legend(loc="center left", bbox_to_anchor=(1, 0.5))
 
-        filename_weights = os.path.join(save_dir, f"weights_{prefix}.png")
+        filename_weights = os.path.join(save_dir, f"weights_{clean_prefix}.png")
         plt.tight_layout()
         plt.savefig(filename_weights, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"Weights plot saved to {filename_weights}")
+        saved_files.append(os.path.basename(filename_weights))
 
     # 3. Loss Breakdown Plot (DIAGNOSTICS for Hallucination Analysis)
     # Only generate if sub-component data is available
@@ -389,8 +405,11 @@ def plot_results(metrics, save_dir, prefix, title="Training Metrics"):
         ax4.grid(True, which="both", ls="--", alpha=0.4)
         ax4.legend(loc="upper right")
 
-        filename_breakdown = os.path.join(save_dir, f"loss_breakdown_{prefix}.png")
+        filename_breakdown = os.path.join(save_dir, f"loss_breakdown_{clean_prefix}.png")
         plt.tight_layout()
         plt.savefig(filename_breakdown, dpi=300, bbox_inches="tight")
         plt.close()
-        print(f"Loss breakdown plot saved to {filename_breakdown}")
+        saved_files.append(os.path.basename(filename_breakdown))
+
+    if saved_files:
+        print(f"Saved training plots ({', '.join(saved_files)}) to {save_dir}")

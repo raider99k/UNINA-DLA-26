@@ -56,6 +56,7 @@ class UNINAMetrics:
         self.plot = plot
         self.save_dir = save_dir
         self.prefix = prefix
+        self.file_prefix = f"{prefix}_" if prefix and not prefix.endswith("_") else prefix
         self.names = names or {i: f"class{i}" for i in range(num_classes)}
         self.stats = []  # list of (correct, conf, pred_cls, target_cls)
         # Confusion matrix aligned with Ultralytics:
@@ -273,15 +274,13 @@ class UNINAMetrics:
         """Print per-class AP table."""
         if len(classes) == 0:
             return
-        print("\n" + "=" * 50)
         print(f"{'Class':<20} {'AP50':>10} {'AP50-95':>10}")
-        print("-" * 50)
+        print("-" * 42)
         for i, cls_idx in enumerate(classes):
             name = self.names.get(int(cls_idx), f"class{int(cls_idx)}")
             print(f"{name:<20} {ap50[i] * 100:>9.1f}% {ap[i] * 100:>9.1f}%")
-        print("-" * 50)
+        print("-" * 42)
         print(f"{'Mean':<20} {ap50.mean() * 100:>9.1f}% {ap.mean() * 100:>9.1f}%")
-        print("=" * 50 + "\n")
 
     def _get_phase_title(self, base_title):
         """Helper to format phase name for plot titles."""
@@ -299,7 +298,7 @@ class UNINAMetrics:
 
         return f"{phase_name} {base_title}"
 
-    def plot_pr_curve(self, filename=None):
+    def plot_pr_curve(self, filename=None, verbose=True):
         """Plot Precision-Recall curve for all classes."""
         if self._results is None:
             print("No results to plot. Run compute() first.")
@@ -307,9 +306,9 @@ class UNINAMetrics:
 
         fig, ax = plt.subplots(figsize=(10, 8))
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}PR_curve.png"
+            self.save_dir + f"/{self.file_prefix}PR_curve.png"
             if self.save_dir
-            else f"{self.prefix}PR_curve.png"
+            else f"{self.file_prefix}PR_curve.png"
         )
 
         # Handle empty results
@@ -332,7 +331,8 @@ class UNINAMetrics:
             plt.tight_layout()
             plt.savefig(save_path, dpi=150)
             plt.close()
-            print(f"PR curve (empty) saved to {save_path}")
+            if verbose:
+                print(f"PR curve (empty) saved to {save_path}")
             return save_path
 
         # Get raw data
@@ -376,26 +376,27 @@ class UNINAMetrics:
         ax.grid(True, alpha=0.3)
 
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}PR_curve.png"
+            self.save_dir + f"/{self.file_prefix}PR_curve.png"
             if self.save_dir
-            else f"{self.prefix}PR_curve.png"
+            else f"{self.file_prefix}PR_curve.png"
         )
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         plt.close()
-        print(f"PR curve saved to {save_path}")
+        if verbose:
+            print(f"PR curve saved to {save_path}")
         return save_path
 
-    def plot_f1_curve(self, filename=None):
+    def plot_f1_curve(self, filename=None, verbose=True):
         """Plot F1 score vs Confidence threshold."""
         if self._results is None:
             print("No results to plot. Run compute() first.")
             return None
 
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}F1_curve.png"
+            self.save_dir + f"/{self.file_prefix}F1_curve.png"
             if self.save_dir
-            else f"{self.prefix}F1_curve.png"
+            else f"{self.file_prefix}F1_curve.png"
         )
 
         # Handle empty results
@@ -419,7 +420,8 @@ class UNINAMetrics:
             plt.tight_layout()
             plt.savefig(save_path, dpi=150)
             plt.close()
-            print(f"F1 curve (empty) saved to {save_path}")
+            if verbose:
+                print(f"F1 curve (empty) saved to {save_path}")
             return save_path
 
         # Get raw data
@@ -468,46 +470,55 @@ class UNINAMetrics:
             ax.scatter([thresholds[best_idx]], [f1_scores[best_idx]], color="red", s=100, zorder=5)
 
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}F1_curve.png"
+            self.save_dir + f"/{self.file_prefix}F1_curve.png"
             if self.save_dir
-            else f"{self.prefix}F1_curve.png"
+            else f"{self.file_prefix}F1_curve.png"
         )
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         plt.close()
-        print(f"F1 curve saved to {save_path}")
+        if verbose:
+            print(f"F1 curve saved to {save_path}")
         return save_path
 
-    def plot_confusion_matrix(self, filename=None):
+    def plot_confusion_matrix(self, filename=None, verbose=True):
         """Plot and save the confusion matrix (raw counts)."""
         labels = [self.names.get(i, f"class{i}") for i in range(self.num_classes)] + ["background"]
 
         fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(
-            self.confusion_matrix,
-            annot=True,
-            fmt="d",
-            cmap="Blues",
-            xticklabels=labels,
-            yticklabels=labels,
-            ax=ax,
-        )
+        if sns is not None:
+            sns.heatmap(
+                self.confusion_matrix,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                xticklabels=labels,
+                yticklabels=labels,
+                ax=ax,
+            )
+        else:
+            ax.imshow(self.confusion_matrix, cmap="Blues")
+            ax.set_xticks(range(len(labels)))
+            ax.set_yticks(range(len(labels)))
+            ax.set_xticklabels(labels)
+            ax.set_yticklabels(labels)
         ax.set_xlabel("True")
         ax.set_ylabel("Predicted")
         ax.set_title(self._get_phase_title("Confusion Matrix (Ultralytics-Compatible, Raw Counts)"))
 
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}confusion_matrix.png"
+            self.save_dir + f"/{self.file_prefix}confusion_matrix.png"
             if self.save_dir
-            else f"{self.prefix}confusion_matrix.png"
+            else f"{self.file_prefix}confusion_matrix.png"
         )
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         plt.close()
-        print(f"Confusion matrix saved to {save_path}")
+        if verbose:
+            print(f"Confusion matrix saved to {save_path}")
         return save_path
 
-    def plot_confusion_matrix_normalized(self, filename=None):
+    def plot_confusion_matrix_normalized(self, filename=None, verbose=True):
         """
         Plot and save the normalized confusion matrix.
 
@@ -523,17 +534,24 @@ class UNINAMetrics:
         cm_normalized = cm / col_sums
 
         fig, ax = plt.subplots(figsize=(10, 8))
-        sns.heatmap(
-            cm_normalized,
-            annot=True,
-            fmt=".2%",
-            cmap="Blues",
-            xticklabels=labels,
-            yticklabels=labels,
-            ax=ax,
-            vmin=0,
-            vmax=1,
-        )
+        if sns is not None:
+            sns.heatmap(
+                cm_normalized,
+                annot=True,
+                fmt=".2%",
+                cmap="Blues",
+                xticklabels=labels,
+                yticklabels=labels,
+                ax=ax,
+                vmin=0,
+                vmax=1,
+            )
+        else:
+            ax.imshow(cm_normalized, cmap="Blues", vmin=0, vmax=1)
+            ax.set_xticks(range(len(labels)))
+            ax.set_yticks(range(len(labels)))
+            ax.set_xticklabels(labels)
+            ax.set_yticklabels(labels)
         ax.set_xlabel("True")
         ax.set_ylabel("Predicted")
         ax.set_title(
@@ -543,28 +561,35 @@ class UNINAMetrics:
         )
 
         save_path = filename or (
-            self.save_dir + f"/{self.prefix}confusion_matrix_normalized.png"
+            self.save_dir + f"/{self.file_prefix}confusion_matrix_normalized.png"
             if self.save_dir
-            else f"{self.prefix}confusion_matrix_normalized.png"
+            else f"{self.file_prefix}confusion_matrix_normalized.png"
         )
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
         plt.close()
-        print(f"Normalized confusion matrix saved to {save_path}")
+        if verbose:
+            print(f"Normalized confusion matrix saved to {save_path}")
         return save_path
 
-    def plot_all(self, save_dir=None, prefix=None):
+    def plot_all(self, save_dir=None, prefix=None, verbose=True):
         """Generate all plots: Confusion Matrix (raw + normalized), PR Curve, F1 Curve."""
         save_dir = save_dir or self.save_dir or "."
-        p = prefix if prefix is not None else self.prefix
+        raw_p = prefix if prefix is not None else self.prefix
+        p = f"{raw_p}_" if raw_p and not raw_p.endswith("_") else raw_p
 
         paths = []
-        paths.append(self.plot_confusion_matrix(f"{save_dir}/{p}confusion_matrix.png"))
+        paths.append(self.plot_confusion_matrix(f"{save_dir}/{p}confusion_matrix.png", verbose=False))
         paths.append(
-            self.plot_confusion_matrix_normalized(f"{save_dir}/{p}confusion_matrix_normalized.png")
+            self.plot_confusion_matrix_normalized(
+                f"{save_dir}/{p}confusion_matrix_normalized.png", verbose=False
+            )
         )
-        paths.append(self.plot_pr_curve(f"{save_dir}/{p}PR_curve.png"))
-        paths.append(self.plot_f1_curve(f"{save_dir}/{p}F1_curve.png"))
+        paths.append(self.plot_pr_curve(f"{save_dir}/{p}PR_curve.png", verbose=False))
+        paths.append(self.plot_f1_curve(f"{save_dir}/{p}F1_curve.png", verbose=False))
 
-        print(f"All plots saved to {save_dir}")
+        if verbose:
+            print(
+                f"Saved validation plots ({p}confusion_matrix*.png, {p}PR_curve.png, {p}F1_curve.png) to {save_dir}"
+            )
         return paths

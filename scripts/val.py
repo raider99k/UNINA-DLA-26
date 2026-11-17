@@ -45,7 +45,7 @@ if __name__ == "__main__":
         "--version",
         type=str,
         default=None,
-        choices=["2.6", "2.5", "3.1", "2", "3"],
+        choices=["3.2", "2.6", "2.5", "3.1", "2", "3"],
         help="Architecture generation (default: auto-detected from checkpoint)",
     )
     parser.add_argument(

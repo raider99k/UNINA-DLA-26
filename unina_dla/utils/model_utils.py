@@ -177,75 +177,44 @@ def fuse_conv_bn_recursive(model):
     """
     fused_count = 0
 
-    # Standard torch modules to ignore for recursion as they don't contain children
-    # we're interested in fusing directly, but we still recurse into containers.
-
     def _fuse_recursive(module):
         nonlocal fused_count
 
-        # 1. Handle nn.Sequential blocks (Common pattern)
+        # 1. Handle nn.Sequential blocks
         if isinstance(module, nn.Sequential):
             i = 0
             while i < len(module) - 1:
                 if isinstance(module[i], nn.Conv2d) and isinstance(module[i + 1], nn.BatchNorm2d):
-                    # Fuse
                     fused = torch.nn.utils.fuse_conv_bn_eval(module[i], module[i + 1])
                     module[i] = fused
                     module[i + 1] = nn.Identity()
                     fused_count += 1
-                    i += 2  # Skip the identity we just placed
+                    i += 2
                 else:
                     _fuse_recursive(module[i])
                     i += 1
-            if i < len(module):  # Handle last element if not checked
+            if i < len(module):
                 _fuse_recursive(module[i])
 
-        # 2. Handle generic modules with child attributes (Custom modules, Heads, etc.)
+        # 2. Handle custom containers with sibling Conv2d + BatchNorm2d attributes
         else:
-            # We look for siblings in the named_children list
-            # Note: This handles cases where Conv and BN are attributes but not in a Sequential
-            # For example: self.conv = Conv2d(...), self.bn = BatchNorm2d(...)
-
-            # First, check children recursively
-            for name, child in module.named_children():
+            for _, child in module.named_children():
                 _fuse_recursive(child)
 
-            # Then, look for sibling combinations within this module's attributes
-            # This is harder as attributes don't have a fixed order unless they are in Sequential.
-            # However, most architectures follow a naming convention or are Sequential.
-            # We already covered Sequential. For custom modules, if they aren't Sequential,
-            # we rely on the fact that if they are strictly Conv->BN, they SHOULD be fused.
-            # 2a. Check for strict naming convention (e.g. self.cv1 followed by self.bn1)
-            # This is a heuristic for DLA optimization where manual fusion is needed.
             children = list(module.named_children())
             i = 0
             while i < len(children) - 1:
                 name1, child1 = children[i]
                 name2, child2 = children[i + 1]
 
-                # Check for Conv2d + BatchNorm2d pair
                 if isinstance(child1, nn.Conv2d) and isinstance(child2, nn.BatchNorm2d):
-                    # Heuristic: Check if they are likely related
-                    # 1. Names are similar (e.g. cv1/bn1, conv1/bn1) OR
-                    # 2. Just strictly consecutive in definition order (risky but needed for some blocks)
-
-                    # We proceed with fusion.
                     fused = torch.nn.utils.fuse_conv_bn_eval(child1, child2)
-
-                    # Replace in the parent module
                     setattr(module, name1, fused)
                     setattr(module, name2, nn.Identity())
-
                     fused_count += 1
-                    i += 2  # Skip the BN we just killed
+                    i += 2
                 else:
-                    # Recurse if no match
-                    _fuse_recursive(child1)
                     i += 1
-
-            # Handle last child
-            if i < len(children):
-                _fuse_recursive(children[i][1])
 
     # Start recursion
     model.eval()

@@ -76,6 +76,8 @@ def validate(
     nms=None,
     prefix="",
     max_det=300,
+    save_images=True,
+    save_plots=True,
 ):
     model.eval()
     max_det = max(1, int(max_det))
@@ -100,16 +102,13 @@ def validate(
     # Auto-detect NMS requirement: YOLO26 (reg_max=0) is NMS-free
     if nms is None:
         nms = False if reg_max == 0 else True
-        if not nms:
-            print("INFO: NMS-free validation enabled (YOLO26/O2O detected).")
 
     metrics = UNINAMetrics(num_classes=num_classes, names=names, save_dir=save_dir, prefix=prefix)
 
     # Validation Loop
     # Save validation sample predictions for visual inspection
-    if save_dir:
-        print(f"Saving debug images to {save_dir}...")
-        save_val_predictions(
+    if save_dir and save_images:
+        n_saved = save_val_predictions(
             model,
             dataloader,
             device,
@@ -118,7 +117,10 @@ def validate(
             num_samples=3,
             conf_thres=0.25,
             prefix=prefix,
+            verbose=False,
         )
+        if n_saved > 0:
+            print(f"Saved {n_saved} debug prediction image(s) to {save_dir}")
 
     pbar = tqdm(dataloader, desc="Validation", leave=False)
 
@@ -301,23 +303,25 @@ def validate(
         for i, k in enumerate(["preprocess", "inference", "postprocess"])
     }
 
-    # Print validation summary in Ultralytics format
-    print("\nValidation Summary:")
-    print(f"  Images: {total_images}")
-    print(f"  Predictions (conf>{conf_thres}): {total_preds_above_thresh}")
+    # Print compact validation summary
+    mode_label = "NMS" if nms else "O2O"
     if total_images > 0 and input_shape is not None:
-        print(
-            f"Speed: {speed['preprocess']:.1f}ms preprocess, {speed['inference']:.1f}ms inference, "
-            f"{speed['postprocess']:.1f}ms postprocess per image at shape {tuple(input_shape)}"
+        speed_str = (
+            f"{speed['preprocess']:.1f}ms pre, {speed['inference']:.1f}ms infer, "
+            f"{speed['postprocess']:.1f}ms post @ {tuple(input_shape)}"
         )
     else:
-        print("  Speed: N/A")
+        speed_str = "Speed: N/A"
+    print(
+        f"Validation [{mode_label} | conf>{conf_thres}]: "
+        f"{total_images} imgs | {total_preds_above_thresh} preds | {speed_str}"
+    )
 
     # Compute metrics first to populate self._results
     stats = metrics.compute()
 
     # Generate metric evaluation plots
-    if save_dir:
+    if save_dir and save_plots:
         metrics.plot_all(save_dir=save_dir, prefix=prefix)
 
     return stats, metrics

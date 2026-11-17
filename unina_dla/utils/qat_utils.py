@@ -1,4 +1,5 @@
 import copy
+import logging
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,17 @@ try:
 except ImportError:
     quant_nn = None
     QuantDescriptor = None
+
+
+def _silence_pytorch_quantization_logs():
+    """Silence verbose routine warnings emitted by pytorch_quantization via absl.logging."""
+    try:
+        from absl import logging as absl_logging
+
+        absl_logging.set_verbosity(absl_logging.ERROR)
+    except Exception:
+        pass
+    logging.getLogger("absl").setLevel(logging.ERROR)
 
 
 class PatchedQuantConvTranspose2d(nn.Module):
@@ -97,7 +109,11 @@ class PatchedQuantConvTranspose2d(nn.Module):
 
 
 def prepare_qat_model(
-    model, per_channel_weights=True, ignore_modules=None, verification_input_size=(1, 3, 640, 640)
+    model,
+    per_channel_weights=True,
+    ignore_modules=None,
+    verification_input_size=(1, 3, 640, 640),
+    verbose=False,
 ):
     """
     Prepare model for QAT:
@@ -110,10 +126,12 @@ def prepare_qat_model(
         per_channel_weights: If True, use per-channel quantization for weights.
         ignore_modules: List of substring names to exclude from quantization.
         verification_input_size: Tuple for input shape to verify fusion.
+        verbose: If True, print every quantized/skipped layer individually.
     """
     if quant_nn is None or QuantDescriptor is None:
         raise ImportError("pytorch_quantization is not installed. Cannot perform QAT.")
 
+    _silence_pytorch_quantization_logs()
     target_device = _infer_model_device(model)
 
     # 0. Set default ignore list if None (preds heads and bilinear deconvolution upsampling)
@@ -218,14 +236,15 @@ def prepare_qat_model(
     )
 
     # 5. Replace modules
-    print(f"Replacing modules with QuantConv2d (Ignoring: {ignore_modules})...")
-    replace_modules_with_quant(model, ignore_modules=ignore_modules)
+    if verbose:
+        print(f"Replacing modules with QuantConv2d (Ignoring: {ignore_modules})...")
+    replace_modules_with_quant(model, ignore_modules=ignore_modules, verbose=verbose)
     sync_quant_device(model, target_device)
 
     return model
 
 
-def replace_modules_with_quant(module, parent_name="", ignore_modules=None):
+def replace_modules_with_quant(module, parent_name="", ignore_modules=None, verbose=False):
     """
     Recursively replace Conv2d with QuantConv2d.
     Excludes layers matching any string in ignore_modules to maintain FP precision.
@@ -236,68 +255,83 @@ def replace_modules_with_quant(module, parent_name="", ignore_modules=None):
     if ignore_modules is None:
         ignore_modules = ["preds", "upsample"]  # Default fallback
 
-    for name, child in module.named_children():
-        full_name = f"{parent_name}.{name}" if parent_name else name
+    counts = {"conv": 0, "deconv": 0, "skipped": 0, "shared": 0}
 
-        # Check if we should skip this module
-        # Strict checking: if any ignore string is a substring of full_name
-        should_skip = any(ign in full_name for ign in ignore_modules)
+    def _recurse(mod, p_name):
+        for name, child in mod.named_children():
+            full_name = f"{p_name}.{name}" if p_name else name
 
-        if should_skip:
-            # Check if it IS a conv layer we are effectively skipping
+            # Strict checking: if any ignore string is a substring of full_name
+            should_skip = any(ign in full_name for ign in ignore_modules)
+
+            if should_skip:
+                if isinstance(child, (nn.Conv2d, nn.ConvTranspose2d)):
+                    counts["skipped"] += 1
+                    if verbose:
+                        print(f"[QAT] Skipping Layer (FP32): {full_name}")
+                continue
+
             if isinstance(child, nn.Conv2d):
-                print(f"[QAT] Skipping Layer (FP32): {full_name}")
-            continue
+                counts["conv"] += 1
+                if verbose:
+                    print(f"[QAT] Quantizing: {full_name}")
+                child_device = child.weight.device
+                new_module = quant_nn.QuantConv2d(
+                    child.in_channels,
+                    child.out_channels,
+                    child.kernel_size,
+                    child.stride,
+                    child.padding,
+                    child.dilation,
+                    child.groups,
+                    child.bias is not None,
+                ).to(child_device)
+                new_module.weight.data = child.weight.data
+                if child.bias is not None:
+                    new_module.bias.data = child.bias.data
+                setattr(mod, name, new_module)
+            elif isinstance(child, nn.ConvTranspose2d):
+                counts["deconv"] += 1
+                if verbose:
+                    print(f"[QAT] Quantizing Deconv: {full_name}")
+                child_device = child.weight.device
+                # Use PatchedQuantConvTranspose2d to fix PyTorch >= 1.12 compatibility
+                new_module = PatchedQuantConvTranspose2d(
+                    child.in_channels,
+                    child.out_channels,
+                    child.kernel_size,
+                    child.stride,
+                    child.padding,
+                    child.output_padding,
+                    child.groups,
+                    child.bias is not None,
+                    child.dilation,
+                ).to(child_device)
+                new_module._quant_conv_transpose.weight.data = child.weight.data
+                if child.bias is not None:
+                    new_module._quant_conv_transpose.bias.data = child.bias.data
+                setattr(mod, name, new_module)
+            else:
+                if hasattr(child, "shared_quantizer") and getattr(child, "shared_quantizer", None) is None:
+                    quant_desc = getattr(quant_nn.QuantConv2d, "default_quant_desc_input", None)
+                    sq = (
+                        quant_nn.TensorQuantizer(quant_desc)
+                        if quant_desc is not None
+                        else quant_nn.TensorQuantizer()
+                    )
+                    child_device = _infer_model_device(child)
+                    child.shared_quantizer = sq.to(child_device) if child_device is not None else sq
+                    counts["shared"] += 1
+                    if verbose:
+                        print(f"[QAT] Attached shared_quantizer to Concat-invariant module: {full_name}")
+                _recurse(child, full_name)
 
-        if isinstance(child, nn.Conv2d):
-            print(f"[QAT] Quantizing: {full_name}")
-            child_device = child.weight.device
-            new_module = quant_nn.QuantConv2d(
-                child.in_channels,
-                child.out_channels,
-                child.kernel_size,
-                child.stride,
-                child.padding,
-                child.dilation,
-                child.groups,
-                child.bias is not None,
-            ).to(child_device)
-            new_module.weight.data = child.weight.data
-            if child.bias is not None:
-                new_module.bias.data = child.bias.data
-            setattr(module, name, new_module)
-        elif isinstance(child, nn.ConvTranspose2d):
-            print(f"[QAT] Quantizing Deconv: {full_name}")
-            child_device = child.weight.device
-            # Use PatchedQuantConvTranspose2d to fix PyTorch >= 1.12 compatibility
-            new_module = PatchedQuantConvTranspose2d(
-                child.in_channels,
-                child.out_channels,
-                child.kernel_size,
-                child.stride,
-                child.padding,
-                child.output_padding,
-                child.groups,
-                child.bias is not None,
-                child.dilation,
-            ).to(child_device)
-            new_module._quant_conv_transpose.weight.data = child.weight.data
-            if child.bias is not None:
-                new_module._quant_conv_transpose.bias.data = child.bias.data
-            setattr(module, name, new_module)
-        # Recurse for other modules (containers etc)
-        else:
-            if hasattr(child, "shared_quantizer") and getattr(child, "shared_quantizer", None) is None:
-                quant_desc = getattr(quant_nn.QuantConv2d, "default_quant_desc_input", None)
-                sq = (
-                    quant_nn.TensorQuantizer(quant_desc)
-                    if quant_desc is not None
-                    else quant_nn.TensorQuantizer()
-                )
-                child_device = _infer_model_device(child)
-                child.shared_quantizer = sq.to(child_device) if child_device is not None else sq
-                print(f"[QAT] Attached shared_quantizer to Concat-invariant module: {full_name}")
-            replace_modules_with_quant(child, full_name, ignore_modules=ignore_modules)
+    _recurse(module, parent_name)
+    if not verbose and parent_name == "":
+        print(
+            f"[QAT] Quantized {counts['conv']} Conv2d + {counts['deconv']} ConvTranspose2d layers "
+            f"(skipped {counts['skipped']} FP32 layers, {counts['shared']} shared_quantizer)."
+        )
 
 
 def _infer_model_device(model):
@@ -313,6 +347,7 @@ def _infer_model_device(model):
 
 def sync_quant_device(model, device=None):
     """Move model parameters, buffers, and quantizer `_amax` tensors onto the target device."""
+    _silence_pytorch_quantization_logs()
     if model is None:
         return model
     target_device = torch.device(device) if device is not None else _infer_model_device(model)
@@ -335,6 +370,7 @@ def enable_calibration(model):
     """Enable calibration mode for all quantized modules."""
     if quant_nn is None:
         return
+    _silence_pytorch_quantization_logs()
     model._quant_observers_frozen = False
     for name, module in model.named_modules():
         if isinstance(module, quant_nn.TensorQuantizer):
@@ -344,6 +380,7 @@ def enable_calibration(model):
 
 def enable_quantization(model, device=None):
     """Enable proper quantization (disable calibration) and align quantizer device."""
+    _silence_pytorch_quantization_logs()
     if quant_nn is not None:
         model._quant_observers_frozen = False
         for name, module in model.named_modules():
@@ -384,14 +421,17 @@ def freeze_quantization_observers(model):
     The weights can still update, but the scale factors (S) are locked.
     This prevents "scale jitter" in the final epochs and helps the loss converge.
     """
+    already_frozen = getattr(model, "_quant_observers_frozen", False)
     model._quant_observers_frozen = True
     if quant_nn is None:
         return
+    _silence_pytorch_quantization_logs()
     frozen_count = 0
     for name, module in model.named_modules():
         if isinstance(module, quant_nn.TensorQuantizer):
             module.disable_calib()  # Stops updating min/max
             module.enable_quant()  # Keeps applying fake-quantization
             frozen_count += 1
-    print(f"[QAT] Froze {frozen_count} quantizer observers (Oscillation Dampening).")
+    if not already_frozen:
+        print(f"[QAT] Froze {frozen_count} quantizer observers (Oscillation Dampening).")
 

@@ -8,14 +8,10 @@ def get_teacher_model(weights_path=None):
     Otherwise, loads the pretrained yolo26x.pt.
     """
     try:
-        if weights_path:
-            model = YOLO(weights_path)
-        else:
-            # Load standard YOLO26-X pretrained on COCO
-            # This will download the weights if not present
-            model = YOLO("yolo26x.pt")
-
-        print(f"Teacher model loaded: {model.info()}")
+        src = weights_path or "yolo26x.pt"
+        model = YOLO(src)
+        n_params = sum(p.numel() for p in model.model.parameters())
+        print(f"Teacher model loaded: {src} ({n_params:,} parameters)")
         return model
     except Exception as e:
         print(f"Error loading teacher model: {e}")

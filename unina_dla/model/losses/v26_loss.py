@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ultralytics.utils.loss import v8DetectionLoss
-from ultralytics.utils.tal import TaskAlignedAssigner, bbox2dist, dist2bbox, make_anchors
+from ultralytics.utils.tal import TaskAlignedAssigner, make_anchors
 
 from unina_dla.utils.box_ops import wise_iou, xywh2xyxy
 
@@ -155,11 +155,6 @@ class YOLO26DetectionLoss(nn.Module, v8DetectionLoss):
         # Wise-IoU v3 running state
         self.register_buffer("wiou_mean", torch.tensor(0.5))
         self.momentum = 0.03
-
-        # Explicit training mode flag (fallback if not managed by nn.Module hierarchy)
-        # Ensures self.training is always available even when loss used standalone
-        if not hasattr(self, "training"):
-            self.training = True
 
         # Optional duplicate/FP suppression for stricter NMS-free behavior.
         # All terms are O2O-head only by wiring in adapters (O2M keeps recall-focused supervision).

@@ -197,12 +197,6 @@ def run_export(args):
     # 3. Initialize Model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if export_with_qat_graph:
-        if quant_nn is None:
-            raise ImportError("Cannot export QAT model: pytorch_quantization not installed.")
-        print("[Export] Mode: QAT (FP32 weights with FakeQuant Nodes)")
-        quant_nn.TensorQuantizer.use_fb_fake_quant = True
-
     is_fused_checkpoint = any("rbr_reparam" in k for k in state_dict.keys())
 
     if export_with_qat_graph:

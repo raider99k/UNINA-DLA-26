@@ -243,13 +243,13 @@ def enable_sparsity(
             conv_params_before += p.numel()
 
     if verbosity >= 1:
-        print(f"\n{'=' * 60}")
-        print("PHASE 1.5: ENABLING 2:4 STRUCTURED SPARSITY")
-        print(f"{'=' * 60}")
-        print(f"Total Parameters: {total_params_before:,}")
-        print(f"Prunable Parameters (Conv/Linear weights): {conv_params_before:,}")
+        print("[Sparsity] Enabling 2:4 structured sparsity...")
+        print(f"  Total Parameters: {total_params_before:,} | Prunable (Conv/Linear): {conv_params_before:,}")
         if ignore_param_patterns:
-            print(f"Ignored Parameters (name contains): {ignore_param_patterns}")
+            if verbosity >= 2:
+                print(f"  Ignored Parameters (name contains): {ignore_param_patterns}")
+            else:
+                print(f"  Ignored Patterns: {len(ignore_param_patterns)} rules (stem, upsample, final pred heads)")
 
     # Choose backend.
     # Name-based layer exclusions are not guaranteed in ASP, so we switch to the
@@ -257,17 +257,14 @@ def enable_sparsity(
     using_asp = HAS_ASP and not ignore_param_patterns
     if using_asp:
         if verbosity >= 1:
-            print("[Backend] Using NVIDIA APEX ASP (optimized)")
+            print("  Backend: NVIDIA APEX ASP (optimized)")
         ASP.prune_trained_model(model, optimizer)
     else:
         if verbosity >= 1:
             if HAS_ASP and ignore_param_patterns:
-                print("[Backend] APEX ASP available, but exclusions requested.")
-                print("          Falling back to Pure PyTorch to enforce layer-level exclusions.")
-            print("[Backend] Using Pure PyTorch backend")
-            print(
-                "          Note: Use create_zero_clamp_hook() to maintain sparsity during training"
-            )
+                print("  Backend: Pure PyTorch (enforcing layer-level exclusions over APEX ASP)")
+            else:
+                print("  Backend: Pure PyTorch (2:4 mask enforced via zero-clamp hook)")
         _prune_model_pytorch(model, verbosity, ignore_param_patterns)
 
     # Count effective (non-zero) params after sparsity
@@ -315,7 +312,7 @@ def enable_sparsity(
             f"  > Effective Parameters: {nonzero_params:,} ({nonzero_params / total_params_before * 100:.1f}% of original)"
         )
         print(f"  > Expected DLA Speedup: ~{100 / (100 - effective_sparsity / 2):.1f}x theoretical")
-        if not using_asp:
+        if not using_asp and verbosity >= 2:
             print(
                 "  > [!] CRITICAL: Call create_zero_clamp_hook() and invoke after each optimizer.step()"
             )

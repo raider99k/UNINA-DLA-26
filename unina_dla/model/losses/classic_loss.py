@@ -78,16 +78,8 @@ class ClassicDetectionLoss(nn.Module, v8DetectionLoss):
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
 
-        # Handle Tuple input (Reg, Cls) -> Concat for v8DetectionLoss structure
+        # Concatenate decoupled (reg, cls) tuples into [B, 4+NC, H, W] feature maps.
         if isinstance(preds, tuple):
-            # reg: [B, 4, H, W], cls: [B, NC, H, W]
-            # But v8DetectionLoss usually expects a list of [B, 4+NC, H, W] if not split
-            # Actually v8DetectionLoss forward expects `preds` to be the list of detection heads outputs.
-            # In UNINA_DLA, preds is ([reg_list], [cls_list]).
-            # We need to reshape/stride/concat to match what v8DetectionLoss expects?
-            # Or just manually extract like v26_loss does.
-
-            # Let's copy the extraction logic from v26_loss to be safe and compatible with our model.
             feats = [torch.cat([r, c], 1) for r, c in zip(preds[0], preds[1])]
 
         pred_distri, pred_scores = torch.cat(

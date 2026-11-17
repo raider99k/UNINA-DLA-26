@@ -376,7 +376,8 @@ class UnifiedTrainer:
             o2m_aux_weight = self._compute_o2m_aux_weight(epoch)
             self.task_loss_fn.set_aux_weight(o2m_aux_weight)
 
-        if epoch == 0:
+        if not getattr(self, "_phase_banner_logged", False):
+            self._phase_banner_logged = True
             phase = self._get_phase_name()
             total_epochs = self._get_phase_total_epochs()
             warmup_epochs = self._get_phase_warmup_epochs(total_epochs)
@@ -394,13 +395,33 @@ class UnifiedTrainer:
             else:
                 fade_desc = f"cosine decay {self.args.fade_start:.4f} -> {self.args.fade_end:.4f}"
                 task_desc = f"cosine rise {self.args.task_weight_start:.4f} -> {self.args.task_weight_end:.4f}"
-            if o2o_topk is not None:
-                curriculum_desc = f"o2o_topk={self.args.o2o_topk_start}->{self.args.o2o_topk_mid}->{self.args.o2o_topk_end}"
-            else:
+
+            if o2o_topk is None:
                 curriculum_desc = "o2o_topk=n/a"
+            elif self.is_qat or self.is_sparse:
+                curriculum_desc = f"o2o_topk={o2o_topk} (fixed)"
+            elif self.args.o2o_topk_start == self.args.o2o_topk_mid == self.args.o2o_topk_end:
+                curriculum_desc = f"o2o_topk={self.args.o2o_topk_end} (fixed)"
+            else:
+                curriculum_desc = (
+                    f"o2o_topk={self.args.o2o_topk_start}->{self.args.o2o_topk_mid}->{self.args.o2o_topk_end}"
+                )
+
+            if not hasattr(self.task_loss_fn, "set_aux_weight"):
+                o2m_aux_desc = "n/a"
+            elif self.is_qat or self.is_sparse:
+                o2m_aux_desc = f"{o2m_aux_weight:.4f} (fixed)"
+            else:
+                start_w = float(getattr(self.args, "o2m_aux_weight_start", o2m_aux_weight))
+                end_w = self._compute_o2m_aux_weight(max(total_epochs - 1, 0))
+                if abs(start_w - end_w) < 1e-6:
+                    o2m_aux_desc = f"{start_w:.4f} (fixed)"
+                else:
+                    o2m_aux_desc = f"{start_w:.4f}->{end_w:.4f}"
+
             print(
                 f"[Trainer] Phase={phase} | epochs={total_epochs} | warmup={warmup_epochs} | "
-                f"fade={fade_desc} | task={task_desc} | {curriculum_desc} | o2m_aux={o2m_aux_weight:.4f}"
+                f"fade={fade_desc} | task={task_desc} | {curriculum_desc} | o2m_aux={o2m_aux_desc}"
             )
             if self.early_stopping is None:
                 self.configure_early_stopping()
@@ -420,9 +441,18 @@ class UnifiedTrainer:
                             "to defer early stopping until strict O2O begins."
                         )
 
-        if o2o_topk is not None:
-            phase_epochs = max(self._get_phase_total_epochs(), 1)
-            print(f"[Trainer] O2O curriculum: epoch {epoch + 1}/{phase_epochs}, topk={o2o_topk}")
+        if o2o_topk is not None and not (self.is_qat or self.is_sparse):
+            prev_topk = getattr(self, "_last_logged_o2o_topk", None)
+            if prev_topk != o2o_topk:
+                phase_epochs = max(self._get_phase_total_epochs(), 1)
+                if prev_topk is None:
+                    print(f"[Trainer] O2O curriculum: epoch {epoch + 1}/{phase_epochs}, topk={o2o_topk}")
+                else:
+                    print(
+                        f"[Trainer] O2O curriculum transition: epoch {epoch + 1}/{phase_epochs}, "
+                        f"topk {prev_topk}->{o2o_topk}"
+                    )
+                self._last_logged_o2o_topk = o2o_topk
 
         # Close Mosaic/Mixup/CopyPaste in final close_mosaic epochs of Phase 1
         if not self.is_qat and not self.is_sparse:
@@ -448,8 +478,12 @@ class UnifiedTrainer:
                         f"(epoch {epoch + 1}/{total_epochs})."
                     )
 
-        # QAT specific: freeze observers late in training
-        if self.is_qat and epoch >= max(1, self.args.epochs_qat - 2):
+        # QAT specific: freeze observers late in training (once)
+        if (
+            self.is_qat
+            and epoch >= max(1, self.args.epochs_qat - 2)
+            and not getattr(self.student, "_quant_observers_frozen", False)
+        ):
             freeze_quantization_observers(self.student)
 
         # Keep BatchNorm statistics frozen during QAT fine-tuning
@@ -484,8 +518,9 @@ class UnifiedTrainer:
             if epoch == 0 and i == 0 and self.args.output_dir:
                 save_batch_image(
                     batch,
-                    os.path.join(self.args.output_dir, "train_batch0.jpg"),
+                    os.path.join(self.args.output_dir, f"{prefix}_train_batch0.jpg"),
                     self.data_cfg.get("names", {}),
+                    printer=pbar.write,
                 )
 
             imgs = batch["img"].to(self.device).float() / 255.0
@@ -604,16 +639,23 @@ class UnifiedTrainer:
                     kd_box_w = breakdown["kd_box_w"]
                     if not kd_epoch_logged:
                         kd_meta = getattr(self, "_last_kd_meta", {})
-                        print(
-                            f"[KD] Epoch {epoch + 1}: source={kd_meta.get('teacher_source', 'unknown')} | "
-                            f"assigner={kd_meta.get('assigner_mode', 'strict')} "
-                            f"(topk={kd_meta.get('mask_topk')}, topk2={kd_meta.get('mask_topk2')})"
+                        kd_sig = (
+                            kd_meta.get("teacher_source", "unknown"),
+                            kd_meta.get("assigner_mode", "strict"),
+                            kd_meta.get("mask_topk"),
+                            kd_meta.get("mask_topk2"),
                         )
+                        if kd_sig != getattr(self, "_last_logged_kd_sig", None):
+                            pbar.write(
+                                f"[KD] Epoch {epoch + 1}: source={kd_sig[0]} | "
+                                f"assigner={kd_sig[1]} (topk={kd_sig[2]}, topk2={kd_sig[3]})"
+                            )
+                            self._last_logged_kd_sig = kd_sig
                         kd_epoch_logged = True
 
             # 5. Backward & Step
             if not torch.isfinite(total_loss):
-                print(f"WARNING: NaN Loss at epoch {epoch} batch {i}")
+                pbar.write(f"WARNING: NaN Loss at epoch {epoch} batch {i}")
                 self.optimizer.zero_grad()
                 continue
 
@@ -672,7 +714,7 @@ class UnifiedTrainer:
 
                 if not _grads_finite:
                     # Non-finite gradients without scaler — skip step
-                    print(
+                    pbar.write(
                         f"WARNING: Non-finite gradients at epoch {epoch} batch {i}, skipping step"
                     )
                     self.optimizer.zero_grad()
@@ -1287,7 +1329,8 @@ class UnifiedTrainer:
                     real_model.head.deploy = True
 
             # Using default conf_thres=0.001 and iou_thres=0.6 for training validation
-            metrics, _ = validate(
+            is_periodic_or_final = ((epoch + 1) % 5 == 0) or is_final_epoch
+            metrics, val_metrics = validate(
                 model_to_val,
                 loader,
                 self.device,
@@ -1296,6 +1339,8 @@ class UnifiedTrainer:
                 names=self.data_cfg.get("names"),
                 save_dir=self.args.output_dir,
                 prefix=prefix,
+                save_images=is_periodic_or_final,
+                save_plots=False,
             )
 
             # Logging
@@ -1353,6 +1398,9 @@ class UnifiedTrainer:
 
             # COMPARATIVE VALIDATION (Every 5 epochs + Last + Early Stop)
             compare_due = ((epoch + 1) % 5 == 0) or is_final_epoch or self.should_stop
+            if (is_new_best or compare_due) and self.args.output_dir and val_metrics is not None:
+                val_metrics.plot_all(save_dir=self.args.output_dir, prefix=prefix)
+
             if compare_due:
                 print(f"\n[Validation] Running Comparative Analysis (Epoch {epoch + 1})...")
 
@@ -1364,7 +1412,7 @@ class UnifiedTrainer:
                 # Existing low-threshold comparison (AP-oriented).
                 secondary_nms = True if is_o2o_architecture else False
                 mode_name = "NMS" if secondary_nms else "O2O"
-                print(f"[Validation] Secondary Pass: Force {mode_name}=True")
+                print(f"[Validation] Secondary Pass: {mode_name} (nms={secondary_nms})")
 
                 metrics_sec, _ = validate(
                     model_to_val,
@@ -1376,6 +1424,8 @@ class UnifiedTrainer:
                     save_dir=self.args.output_dir,
                     prefix=f"{prefix}_{mode_name}",
                     nms=secondary_nms,
+                    save_images=True,
+                    save_plots=True,
                 )
 
                 map_primary = metrics["mAP50"]
