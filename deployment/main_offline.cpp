@@ -2,7 +2,6 @@
  * @file main_offline.cpp
  * @brief Offline 2D Perception Testing (Image Files, Directories, and Videos)
  *
- * Use this to test the TensorRT/DLA inference pipeline on offline media:
  * - Single image: ./unina_perception_offline engine.engine image.jpg
  * - Directory:    ./unina_perception_offline engine.engine ./frames/ --dir
  * - Video:        ./unina_perception_offline engine.engine video.mp4
@@ -23,20 +22,12 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-// ============================================================================
-// Signal Handling
-// ============================================================================
-
 static volatile bool g_running = true;
 
 void signal_handler(int signum) {
   std::cerr << "\nReceived signal " << signum << ", stopping..." << std::endl;
   g_running = false;
 }
-
-// ============================================================================
-// Dynamic Color Palette for Arbitrary Class Counts
-// ============================================================================
 
 static cv::Scalar get_palette_color(int class_id) {
   static const std::vector<cv::Scalar> palette = {
@@ -66,10 +57,6 @@ static cv::Scalar get_palette_color(int class_id) {
   uint8_t b = static_cast<uint8_t>(((hash >> 16) & 0xFF) | 0x40);
   return cv::Scalar(b, g, r);
 }
-
-// ============================================================================
-// Main
-// ============================================================================
 
 int main(int argc, char **argv) {
   std::signal(SIGINT, signal_handler);
@@ -107,7 +94,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  // ========== Load Configuration ==========
   unina::Config config;
   config.load(config_path);
 
@@ -120,14 +106,12 @@ int main(int argc, char **argv) {
   int config_h = config.get_int("input_height", unina::kInputH);
   auto class_names = config.get_array("class_names");
 
-  // ========== Initialize Image Source ==========
   unina::FileImageSource source(input_path, is_directory);
   if (!source.init()) {
     std::cerr << "Failed to initialize image source" << std::endl;
     return -1;
   }
 
-  // ========== Initialize TensorRT Runner ==========
   unina::UninaPerception runner;
   if (!runner.init(engine_path)) {
     std::cerr << "Failed to initialize TensorRT engine." << std::endl;
@@ -137,8 +121,14 @@ int main(int argc, char **argv) {
   int input_w = runner.get_input_width() > 0 ? runner.get_input_width() : config_w;
   int input_h = runner.get_input_height() > 0 ? runner.get_input_height() : config_h;
 
-  unina::cuda_preprocess_init(1920 * 1200 * 4);
-  unina::cuda_postprocess_init();
+  size_t src_buf_bytes = 4096ULL * 4096ULL * 3;
+  if (unina::cuda_preprocess_init(src_buf_bytes) != cudaSuccess ||
+      unina::cuda_postprocess_init() != cudaSuccess) {
+    std::cerr << "Failed to initialize CUDA buffers." << std::endl;
+    unina::cuda_preprocess_destroy();
+    unina::cuda_postprocess_destroy();
+    return -1;
+  }
   cudaStream_t stream = runner.get_stream();
 
   std::cout << "\n========================================" << std::endl;
@@ -146,7 +136,6 @@ int main(int argc, char **argv) {
             << std::endl;
   std::cout << "========================================\n" << std::endl;
 
-  // ========== Process Loop ==========
   unina::ImageFrame frame;
   double total_latency_ms = 0;
   int total_detections = 0;
@@ -167,6 +156,19 @@ int main(int argc, char **argv) {
     cv::Mat vis_image(frame.height, frame.width, CV_8UC3,
                       const_cast<uint8_t *>(frame.cpu_data));
 
+    size_t needed_bytes = static_cast<size_t>(frame.width) *
+                          static_cast<size_t>(frame.height) * 3;
+    if (needed_bytes > src_buf_bytes) {
+      if (unina::cuda_preprocess_init(needed_bytes) != cudaSuccess) {
+        std::cerr << "Failed to grow CUDA preprocess buffer to "
+                  << needed_bytes << " bytes; skipping frame " << frame_count
+                  << std::endl;
+        frame_count++;
+        continue;
+      }
+      src_buf_bytes = needed_bytes;
+    }
+
     auto start = std::chrono::high_resolution_clock::now();
 
     void *trt_input = runner.get_input_gpu_ptr();
@@ -178,6 +180,12 @@ int main(int argc, char **argv) {
       scale = unina::cuda_preprocess(frame.cpu_data, frame.width, frame.height,
                                      static_cast<float *>(trt_input), input_w,
                                      input_h, false, stream);
+    }
+    if (scale <= 0.0f) {
+      std::cerr << "CUDA preprocess failed on frame " << frame_count
+                << "; skipping." << std::endl;
+      frame_count++;
+      continue;
     }
 
     runner.inference();

@@ -5,10 +5,9 @@
  * @brief Abstract interface for image sources
  *
  * This interface allows the perception pipeline to work with:
- * - Live ZED X camera
- * - Pre-recorded images (from ROS2 bag extraction)
+ * - Pre-recorded image directories
  * - Video files
- * - Synthetic test data
+ * - Live camera streams or synthetic test data
  */
 
 #include <cstdint>

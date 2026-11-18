@@ -1,7 +1,6 @@
 # UNINA-DLA
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS_2-Humble-brightgreen.svg)](https://docs.ros.org/en/humble/)
 [![Target: Jetson Orin](https://img.shields.io/badge/Hardware-Jetson_Orin-76B900.svg)](https://developer.nvidia.com/embedded/jetson-orin)
 
 UNINA-DLA is a real-time object detection framework designed for complete execution on the NVIDIA Jetson Orin Deep Learning Accelerator (NVDLA 2.0). 
@@ -146,7 +145,7 @@ python -m unina_dla.utils.verify_dla_onnx unina_dla_qat.onnx
 ## Deployment
 
 > [!WARNING]
-> **Hardware Testing Notice**: The deployment software (C++ standalone and ROS 2 Humble node) and actual DLA hardware residency have not been empirically tested on physical NVIDIA Jetson Orin hardware due to a lack of target hardware access.
+> **Hardware Testing Notice**: The standalone C++ deployment software and actual DLA hardware residency have not been empirically tested on physical NVIDIA Jetson Orin hardware due to a lack of target hardware access.
 
 ### 1. TensorRT Engine Compilation (on Jetson Orin)
 
@@ -171,25 +170,12 @@ trtexec --onnx=unina_dla_qat.onnx \
 ```bash
 cd deployment
 mkdir -p build && cd build
-cmake -DUSE_ROS=OFF -DUSE_ZED=OFF .. && make -j$(nproc)
-./unina_perception ../unina_dla_qat_dla0.engine sample_cone.jpg
+cmake .. && make -j$(nproc)
+./unina_perception ../unina_dla_qat_dla0.engine sample_image.jpg
+./unina_perception_offline ../unina_dla_qat_dla0.engine /path/to/images/ --dir
 ```
 
-### 3. ROS 2 Humble Integration
-
-```bash
-cd ~/ros2_ws/src
-ln -s /path/to/UNINA-DLA-26/deployment unina_perception_dla
-cd ~/ros2_ws
-colcon build --symlink-install --packages-select unina_perception_dla --cmake-args -DUSE_ZED=ON -DUSE_ROS=ON
-source install/setup.bash
-
-ros2 run unina_perception_dla unina_perception_ros \
-  --ros-args -p engine_path:=/path/to/unina_dla_qat_dla0.engine \
-             -p config_path:=/path/to/config.yaml
-```
-
-For full setup instructions, see [**`docs/DEPLOYMENT_GUIDE.md`**](docs/DEPLOYMENT_GUIDE.md).
+For full setup instructions, see [**`docs/DEPLOYMENT_GUIDE.md`**](docs/DEPLOYMENT_GUIDE.md) and [**`deployment/VM_BUILD.md`**](deployment/VM_BUILD.md).
 
 ---
 
@@ -223,16 +209,16 @@ UNINA-DLA-26/
 ├── configs/                      # Dataset and benchmark configurations
 │   ├── benchmark_fsd.yaml        # Benchmark suite configuration
 │   └── formula_student.yaml      # Formula Student reference configuration
-├── deployment/                   # C++ TensorRT deployment (Standalone & ROS 2)
-│   ├── CMakeLists.txt            # Modular CMake build
+├── deployment/                   # Standalone C++ / CUDA / TensorRT deployment
+│   ├── CMakeLists.txt            # CMake build for standalone executables
 │   ├── VM_BUILD.md               # Workstation / VM compilation guide
 │   ├── config.yaml               # Deployment configuration
-│   ├── include/                  # C++ headers (Perception3D, Cone3D, CUDA kernels)
-│   └── src/                      # C++ implementation files
+│   ├── include/                  # C++ headers (UninaPerception, Config, CUDA kernels)
+│   └── src/                      # C++ and CUDA implementation files
 ├── docs/                         # Technical documentation
 │   ├── ARCHITECTURE.md           # Architecture specifications, math proofs, DLA constraints
 │   ├── BENCHMARK_REPORT.md       # Multi-platform benchmark suite results
-│   ├── DEPLOYMENT_GUIDE.md       # Jetson Orin deployment & ROS 2 setup
+│   ├── DEPLOYMENT_GUIDE.md       # Jetson Orin & TensorRT deployment setup
 │   ├── TRAINING_REPORT.md        # Multi-phase training dynamics and generation comparison
 │   └── ULTRALYTICS_INFERENCE.md  # Ultralytics Python inference wrapper guide
 ├── scripts/                      # Workflow and utility scripts

@@ -10,19 +10,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# CUDA Configuration for Jetson Orin (sm_87)
-# Note: For non-Orin GPUs (workstation/Colab/Kaggle), override with: -DCMAKE_CUDA_ARCHITECTURES=native
+# Default to Jetson Orin (sm_87); override with -DCMAKE_CUDA_ARCHITECTURES=native on other GPUs
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
 
-# ============================================================================
-# Core Dependencies (Standard C++ / CUDA / TensorRT / OpenCV)
-# ============================================================================
 find_package(OpenCV REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
-# TensorRT
 find_library(NVINFER_LIB nvinfer)
 find_library(NVPARSERS_LIB nvparsers)
 if(NOT NVINFER_LIB)
@@ -37,9 +32,6 @@ if(EXISTS "/usr/include/aarch64-linux-gnu")
     include_directories(/usr/include/aarch64-linux-gnu)
 endif()
 
-# ============================================================================
-# Shared Sources
-# ============================================================================
 set(CUDA_SOURCES
     src/CudaPreprocess.cu
     src/CudaPostprocess.cu
@@ -54,9 +46,6 @@ if(NVPARSERS_LIB)
     list(APPEND TRT_LIBS ${NVPARSERS_LIB})
 endif()
 
-# ============================================================================
-# Target 1: unina_perception (Standalone single-image inference)
-# ============================================================================
 add_executable(unina_perception
     main.cpp
     ${CORE_SOURCES}
@@ -69,9 +58,6 @@ target_link_libraries(unina_perception
 )
 add_executable(unina_perception_standalone ALIAS unina_perception)
 
-# ============================================================================
-# Target 2: unina_perception_offline (Batch directory / video testing)
-# ============================================================================
 add_executable(unina_perception_offline
     main_offline.cpp
     ${CORE_SOURCES}
@@ -83,9 +69,6 @@ target_link_libraries(unina_perception_offline
     ${TRT_LIBS}
 )
 
-# ============================================================================
-# Installation Rules
-# ============================================================================
 install(TARGETS unina_perception unina_perception_offline
     RUNTIME DESTINATION bin
 )

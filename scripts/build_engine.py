@@ -351,6 +351,30 @@ def _build_engine_via_python_api(
     return 0
 
 
+def _detect_trtexec_major_version(trtexec_bin):
+    """Detect TensorRT major version from `trtexec --version` (returns int or None)."""
+    import re
+
+    try:
+        res = subprocess.run(
+            [trtexec_bin, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+        )
+        out = res.stdout or ""
+        m = re.search(r"TensorRT\s+v(\d{2})\d{4}", out)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"TensorRT\s+version:\s*(\d+)\.", out)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
 def build_engine(args):
     """Constructs and executes the trtexec command based on arguments."""
 
@@ -433,21 +457,30 @@ def build_engine(args):
             return meta_rc
         return ret
 
+    trt_major = _detect_trtexec_major_version(trtexec_bin)
+    is_trt11_plus = trt_major is not None and trt_major >= 11
+
     cmd = [trtexec_bin]
 
     # Common Flags
     cmd.append(f"--onnx={args.onnx}")
     cmd.append(f"--saveEngine={output_path}")
 
-    # Precision
-    if enable_fp16:
-        cmd.append("--fp16")
-    if enable_int8:
-        cmd.append("--int8")
+    # Precision (TensorRT 11+ uses strong typing by default and removed --fp16/--int8/--best)
+    if is_trt11_plus:
+        print(
+            f"[Info] TensorRT {trt_major}+ detected (strongly typed): "
+            "omitting legacy --fp16/--int8/--best/--calib trtexec flags."
+        )
+    else:
+        if enable_fp16:
+            cmd.append("--fp16")
+        if enable_int8:
+            cmd.append("--int8")
 
-    # Use --best if both precisions are enabled (Default) for maximum tactic auto-tuning
-    if enable_fp16 and enable_int8:
-        cmd.append("--best")
+        # Use --best if both precisions are enabled (Default) for maximum tactic auto-tuning
+        if enable_fp16 and enable_int8:
+            cmd.append("--best")
 
     # Sparsity
     if enable_sparsity:
@@ -480,7 +513,7 @@ def build_engine(args):
             # This avoids GPU reformatting kernels
             cmd.append("--inputIOFormats=fp16:dla_hwc4")
             print("[Tip] Using DLA-optimized input format (fp16:dla_hwc4).")
-            print("      - Ideal for ZED X deployment.")
+            print("      - Ideal for 4-channel BGRA/RGBA camera deployment.")
             print(
                 "      - If testing offline (jpg/mp4), use --input_format=fp16:chw to avoid mismatches."
             )
@@ -514,8 +547,8 @@ def build_engine(args):
     if args.mem_pool_size:
         cmd.append(f"--memPoolSize={args.mem_pool_size}")
 
-    # Calibration Cache (for QAT backup if needed)
-    if args.calib and os.path.exists(args.calib):
+    # Calibration Cache (for QAT backup if needed; unsupported in TensorRT 11+ strongly-typed trtexec)
+    if not is_trt11_plus and args.calib and os.path.exists(args.calib):
         cmd.append(f"--calib={args.calib}")
 
     # 5. Execute

@@ -121,6 +121,7 @@ bool UninaPerception::init(const std::string &engine_path) {
     return false;
 
   // 2.5 Hardware Acceleration Diagnostics
+#if NV_TENSORRT_MAJOR < 11
   int dla_core = engine_->getDLACore();
   if (dla_core != -1) {
     std::cout << "[TRT] Info: Engine targets DLA Core " << dla_core
@@ -135,6 +136,10 @@ bool UninaPerception::init(const std::string &engine_path) {
     std::cout << "[TRT] Warning: Engine built for GPU. DLA ignored."
               << std::endl;
   }
+#else
+  std::cout << "[TRT] Info: Running on GPU (DLA runtime API disabled on TensorRT 11+)."
+            << std::endl;
+#endif
 
   // 3. Allocate Memory
   int nbBindings = engine_->getNbIOTensors();
@@ -182,7 +187,7 @@ bool UninaPerception::init(const std::string &engine_path) {
 
   size_t vol = 1;
   for (int i = 0; i < dims.nbDims; ++i)
-    vol *= std::max(1, dims.d[i]);
+    vol *= static_cast<size_t>(std::max<long long>(1, dims.d[i]));
 
   // Capture input dimensions for dynamic preprocessing & stride calculation
   if (dims.nbDims >= 4) {

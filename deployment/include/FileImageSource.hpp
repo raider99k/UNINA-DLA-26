@@ -6,7 +6,7 @@
  *
  * This provides offline image input for testing and debugging:
  * - Single image files
- * - Directory of images (for ROS2 bag extracted frames)
+ * - Directory of images
  * - Video files
  */
 

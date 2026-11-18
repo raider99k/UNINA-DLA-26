@@ -10,10 +10,6 @@
 #include <iostream>
 #include <opencv2/opencv.hpp>
 
-// ============================================================================
-// Signal Handling for Graceful Shutdown
-// ============================================================================
-
 static volatile bool g_running = true;
 
 void signal_handler(int signum) {
@@ -26,10 +22,6 @@ void setup_signal_handlers() {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
 }
-
-// ============================================================================
-// Dynamic Color Palette for Arbitrary Class Counts
-// ============================================================================
 
 cv::Scalar get_palette_color(int class_id) {
   static const std::vector<cv::Scalar> palette = {
@@ -53,7 +45,6 @@ cv::Scalar get_palette_color(int class_id) {
   if (class_id >= 0 && class_id < static_cast<int>(palette.size())) {
     return palette[class_id];
   }
-  // Deterministic color hashing for arbitrary C >= 16 classes
   uint32_t hash = static_cast<uint32_t>(class_id) * 2654435761u;
   uint8_t r = static_cast<uint8_t>((hash & 0xFF) | 0x40);
   uint8_t g = static_cast<uint8_t>(((hash >> 8) & 0xFF) | 0x40);
@@ -61,12 +52,7 @@ cv::Scalar get_palette_color(int class_id) {
   return cv::Scalar(b, g, r);
 }
 
-// ============================================================================
-// Main Entry Point
-// ============================================================================
-
 int main(int argc, char **argv) {
-  // Setup signal handlers for graceful shutdown
   setup_signal_handlers();
 
   if (argc < 3) {
@@ -80,7 +66,6 @@ int main(int argc, char **argv) {
   std::string image_path = argv[2];
   std::string config_path = (argc > 3) ? argv[3] : "config.yaml";
 
-  // ========== Load Configuration ==========
   unina::Config config;
   float conf_threshold = 0.25f;
   float score_threshold = 0.45f;
@@ -104,7 +89,6 @@ int main(int argc, char **argv) {
     std::cout << "Config file not found, using defaults" << std::endl;
   }
 
-  // ========== 1. Initialize Engine ==========
   unina::UninaPerception runner;
   std::cout << "Initializing Engine..." << std::endl;
   if (!runner.init(engine_path)) {
@@ -119,45 +103,48 @@ int main(int argc, char **argv) {
                     ? runner.get_input_height()
                     : config.get_int("input_height", unina::kInputH);
 
-  // ========== 2. Initialize CUDA Resources ==========
-  unina::cuda_preprocess_init(4096 * 4096 * 3);
-  unina::cuda_postprocess_init();
-
-  // Use the runner's internal CUDA stream for all operations
-  cudaStream_t stream = runner.get_stream();
-
-  // ========== 3. Load Image (CPU) ==========
   cv::Mat img = cv::imread(image_path);
   if (img.empty()) {
     std::cerr << "Failed to load image." << std::endl;
-    unina::cuda_preprocess_destroy();
-    unina::cuda_postprocess_destroy();
     return -1;
   }
   std::cout << "Image loaded: " << img.cols << "x" << img.rows << std::endl;
 
-  // ========== 4. Preprocess (CUDA) ==========
+  size_t src_bytes = static_cast<size_t>(img.cols) *
+                     static_cast<size_t>(img.rows) * 3;
+  if (unina::cuda_preprocess_init(src_bytes) != cudaSuccess ||
+      unina::cuda_postprocess_init() != cudaSuccess) {
+    std::cerr << "Failed to initialize CUDA buffers." << std::endl;
+    unina::cuda_preprocess_destroy();
+    unina::cuda_postprocess_destroy();
+    return -1;
+  }
+
+  cudaStream_t stream = runner.get_stream();
+
   void *trt_input = runner.get_input_gpu_ptr();
   float scale;
 
   if (runner.input_is_fp16()) {
-    // FP16 input for DLA
     scale = unina::cuda_preprocess_fp16(img.data, img.cols, img.rows, trt_input,
                                         input_w, input_h, false, stream);
   } else {
-    // FP32 input
     scale = unina::cuda_preprocess(
         img.data, img.cols, img.rows, static_cast<float *>(trt_input),
         input_w, input_h, false, stream);
   }
+  if (scale <= 0.0f) {
+    std::cerr << "CUDA preprocess failed." << std::endl;
+    unina::cuda_preprocess_destroy();
+    unina::cuda_postprocess_destroy();
+    return -1;
+  }
 
-  // ========== 5. Inference (DLA) ==========
   std::cout << "Running Inference..." << std::endl;
   auto start = std::chrono::high_resolution_clock::now();
 
   runner.inference();
 
-  // ========== 6. Postprocess (CUDA) ==========
   auto output_ptrs = runner.get_output_gpu_ptrs();
   const auto &output_layouts = runner.get_output_layouts();
   int num_scales = runner.get_num_scales();
@@ -189,14 +176,11 @@ int main(int argc, char **argv) {
   std::cout << "Total Latency (Pre+Inf+Post): " << ms << " ms" << std::endl;
   std::cout << "Detections: " << detections.size() << std::endl;
 
-  // ========== 7. Coordinate Adjustment (CPU) ==========
   int x_off, y_off;
   unina::cuda_preprocess_get_offsets(x_off, y_off);
   unina::adjust_detections_for_letterbox(detections, x_off, y_off, scale,
                                          img.cols, img.rows);
 
-  // ========== 8. Visualize (CPU) ==========
-  // Get class names from config if available
   auto class_names = config.get_array("class_names");
 
   for (const auto &det : detections) {
@@ -205,7 +189,6 @@ int main(int argc, char **argv) {
     cv::rectangle(img, cv::Point(det.x1, det.y1), cv::Point(det.x2, det.y2),
                   color, 2);
 
-    // Draw label
     std::string class_str;
     if (det.class_id >= 0 && det.class_id < static_cast<int>(class_names.size())) {
       class_str = class_names[det.class_id];
@@ -221,7 +204,6 @@ int main(int argc, char **argv) {
   cv::imwrite("output.jpg", img);
   std::cout << "Saved output.jpg" << std::endl;
 
-  // ========== Cleanup ==========
   unina::cuda_preprocess_destroy();
   unina::cuda_postprocess_destroy();
 

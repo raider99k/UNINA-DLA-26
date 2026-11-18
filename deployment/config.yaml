@@ -1,61 +1,28 @@
 # UNINA-DLA Deployment Configuration
-# This file contains externalized configuration for the deployment pipeline.
 # Edit these values to tune inference behavior without recompiling.
 
-# ==============================================================================
 # Detection Thresholds
-# ==============================================================================
-
-# Minimum confidence threshold for detections (0.0 - 1.0)
-# Lower values = more detections (more false positives)
-# Higher values = fewer detections (more false negatives)
 conf_threshold: 0.25
-
-# Score threshold for class filtering (0.0 - 1.0)
-# Used during NMS if applicable
 score_threshold: 0.45
 
-# Enable class-wise NMS in postprocess.
-# false = keep current pure O2O behavior (no suppression)
-# true  = apply class-wise NMS after decode
+# Enable class-wise NMS in postprocess (false = pure O2O / no suppression)
 use_nms: false
-
-# IoU threshold used when use_nms=true
 nms_iou_threshold: 0.60
 
-# ==============================================================================
-# Model Configuration
-# ==============================================================================
-
-# Input image dimensions (must match trained model AND TensorRT engine)
-# Valid 16:10 resolutions (match aspect ratio, all DLA-compatible):
-#   512x320   - Fastest inference, shortest detection range
-#   768x480   - Balanced speed/range (default)
-#   1024x640  - Recommended for best detection range
-#   1280x800  - Maximum range, slower inference
-# NOTE: Dimensions must be multiples of 32 for DLA compatibility
+# Fallback input dimensions (auto-detected from the TensorRT engine at runtime)
+# Dimensions must be multiples of 32 for DLA compatibility.
 input_width: 960
 input_height: 608
 
-# Number of object classes
+# Number of object classes and display names
 num_classes: 4
-
-# Class names (for visualization)
 class_names:
   - "Yellow"
   - "Blue"
   - "SmallOrange"
   - "LargeOrange"
 
-# ==============================================================================
 # Performance Tuning
-# ==============================================================================
-
-# Maximum detections per frame (prevents buffer overflow)
 max_detections: 1000
-
-# CUDA preprocessing block size (32x32 recommended for most GPUs)
 preprocess_block_size: 32
-
-# CUDA postprocess block size (16x16 recommended)
 postprocess_block_size: 16

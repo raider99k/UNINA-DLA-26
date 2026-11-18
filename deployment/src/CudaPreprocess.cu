@@ -99,7 +99,7 @@ __device__ __forceinline__ float bilinear_sample_bgr(const uint8_t *src,
 }
 
 /**
- * @brief Bilinear interpolation for RGBA/BGRA (4-channel) images (ZED X)
+ * @brief Bilinear interpolation for RGBA/BGRA (4-channel) images
  */
 __device__ __forceinline__ float bilinear_sample_rgba(const uint8_t *src,
                                                       int src_w, int src_h,
@@ -185,10 +185,9 @@ __global__ void preprocess_kernel_bgr(const uint8_t *__restrict__ src,
 }
 
 /**
- * @brief Fused preprocessing kernel for BGRA images (ZED X camera)
+ * @brief Fused preprocessing kernel for 4-channel BGRA images
  *
- * ZED SDK outputs BGRA format in GPU memory. This kernel handles 4-channel
- * input and ignores the alpha channel.
+ * Handles BGRA input in GPU memory and ignores the alpha channel.
  */
 __global__ void preprocess_kernel_bgra(const uint8_t *__restrict__ src,
                                        float *__restrict__ dst, int src_w,
@@ -277,7 +276,7 @@ __global__ void preprocess_kernel_bgr_fp16(const uint8_t *__restrict__ src,
 }
 
 /**
- * @brief FP16 preprocessing kernel for BGRA images (ZED X)
+ * @brief FP16 preprocessing kernel for 4-channel BGRA images
  */
 __global__ void preprocess_kernel_bgra_fp16(const uint8_t *__restrict__ src,
                                             __half *__restrict__ dst, int src_w,
@@ -375,10 +374,9 @@ float cuda_preprocess(const uint8_t *src, int src_w, int src_h, float *dst,
 }
 
 /**
- * @brief Preprocess BGRA image (ZED X camera) for DLA inference
+ * @brief Preprocess 4-channel BGRA GPU image for DLA/GPU inference
  *
- * Same as cuda_preprocess but handles 4-channel BGRA input.
- * Source MUST be on GPU (ZED SDK provides GPU memory directly).
+ * Same as cuda_preprocess but handles 4-channel BGRA input on GPU memory.
  */
 float cuda_preprocess_bgra(const uint8_t *src, int src_w, int src_h, float *dst,
                            int dst_w, int dst_h, cudaStream_t stream) {
@@ -460,7 +458,7 @@ float cuda_preprocess_fp16(const uint8_t *src, int src_w, int src_h, void *dst,
 }
 
 /**
- * @brief Preprocess BGRA image (ZED X) to FP16 output (for DLA input)
+ * @brief Preprocess 4-channel BGRA GPU image to FP16 output (for DLA input)
  */
 float cuda_preprocess_bgra_fp16(const uint8_t *src, int src_w, int src_h,
                                 void *dst, int dst_w, int dst_h,
@@ -532,7 +530,7 @@ bilinear_sample_bgra_to_rgba(const uint8_t *src, int src_w, int src_h, float x,
 /**
  * @brief Fused preprocessing kernel for BGRA→HWC4 FP16 output (DLA native)
  *
- * ZED X outputs BGRA in HWC format. This kernel:
+ * Input is BGRA in HWC format. This kernel:
  * 1. Letterbox resize with bilinear interpolation
  * 2. BGRA → RGBA color conversion (DLA expects RGB order)
  * 3. Keeps HWC layout (channel-interleaved, 4 channels)
@@ -591,12 +589,11 @@ __global__ void preprocess_kernel_bgra_to_hwc4_fp16(
 }
 
 /**
- * @brief Preprocess BGRA image (ZED X) to HWC4 FP16 output (DLA native format)
+ * @brief Preprocess 4-channel BGRA GPU image to HWC4 FP16 output (DLA native format)
  *
- * This is the optimal preprocessing path for DLA: ZED's BGRA HWC output is
- * converted directly to RGBA HWC4 FP16, eliminating the CHW transpose.
+ * Converts BGRA HWC input directly to RGBA HWC4 FP16, eliminating the CHW transpose.
  *
- * @param src Source BGRA image on GPU (from ZED SDK sl::Mat::getPtr)
+ * @param src Source BGRA image in GPU memory
  * @param src_w Source image width
  * @param src_h Source image height
  * @param dst Destination buffer - FP16 HWC4 format (__half*), size = dst_w *
