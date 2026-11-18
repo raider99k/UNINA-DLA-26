@@ -1,21 +1,24 @@
 /**
  * @file main_offline.cpp
- * @brief Offline Perception Testing (Image Files / ROS2 Bag Frames)
+ * @brief Offline 2D Perception Testing (Image Files, Directories, and Videos)
  *
- * Use this to test the perception pipeline without a live camera:
- * - Single image: ./unina_perception_offline engine.plan image.jpg
- * - Directory:    ./unina_perception_offline engine.plan ./frames/ --dir
- * - Video:        ./unina_perception_offline engine.plan video.mp4
- *
- * For ROS2 bags: Extract frames to a directory first, then use --dir mode.
+ * Use this to test the TensorRT/DLA inference pipeline on offline media:
+ * - Single image: ./unina_perception_offline engine.engine image.jpg
+ * - Directory:    ./unina_perception_offline engine.engine ./frames/ --dir
+ * - Video:        ./unina_perception_offline engine.engine video.mp4
  */
 
 #include "Config.hpp"
+#include "CudaPostprocess.cuh"
+#include "CudaPreprocess.cuh"
 #include "FileImageSource.hpp"
-#include "Perception3D.hpp"
+#include "UninaPerception.hpp"
+#include "common.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <opencv2/opencv.hpp>
@@ -32,6 +35,39 @@ void signal_handler(int signum) {
 }
 
 // ============================================================================
+// Dynamic Color Palette for Arbitrary Class Counts
+// ============================================================================
+
+static cv::Scalar get_palette_color(int class_id) {
+  static const std::vector<cv::Scalar> palette = {
+      cv::Scalar(0, 255, 255),   // Class 0
+      cv::Scalar(255, 0, 0),     // Class 1
+      cv::Scalar(0, 140, 255),   // Class 2
+      cv::Scalar(0, 69, 255),    // Class 3
+      cv::Scalar(0, 255, 0),     // Class 4
+      cv::Scalar(255, 0, 255),   // Class 5
+      cv::Scalar(255, 255, 0),   // Class 6
+      cv::Scalar(180, 105, 255), // Class 7
+      cv::Scalar(255, 191, 0),   // Class 8
+      cv::Scalar(50, 205, 50),   // Class 9
+      cv::Scalar(203, 192, 255), // Class 10
+      cv::Scalar(0, 215, 255),   // Class 11
+      cv::Scalar(238, 130, 238), // Class 12
+      cv::Scalar(75, 0, 130),    // Class 13
+      cv::Scalar(128, 128, 0),   // Class 14
+      cv::Scalar(0, 128, 128),   // Class 15
+  };
+  if (class_id >= 0 && class_id < static_cast<int>(palette.size())) {
+    return palette[class_id];
+  }
+  uint32_t hash = static_cast<uint32_t>(class_id) * 2654435761u;
+  uint8_t r = static_cast<uint8_t>((hash & 0xFF) | 0x40);
+  uint8_t g = static_cast<uint8_t>(((hash >> 8) & 0xFF) | 0x40);
+  uint8_t b = static_cast<uint8_t>(((hash >> 16) & 0xFF) | 0x40);
+  return cv::Scalar(b, g, r);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -41,14 +77,14 @@ int main(int argc, char **argv) {
 
   if (argc < 3) {
     std::cerr << "Usage: ./unina_perception_offline <engine_path> <input_path> "
-                 "[--dir] [--output output_dir]"
+                 "[--dir] [--output output_dir] [--config config.yaml]"
               << std::endl;
     std::cerr << "\nExamples:" << std::endl;
-    std::cerr << "  ./unina_perception_offline model.plan test.jpg"
+    std::cerr << "  ./unina_perception_offline model.engine test.jpg"
               << std::endl;
-    std::cerr << "  ./unina_perception_offline model.plan ./frames/ --dir"
+    std::cerr << "  ./unina_perception_offline model.engine ./frames/ --dir"
               << std::endl;
-    std::cerr << "  ./unina_perception_offline model.plan video.mp4 --output "
+    std::cerr << "  ./unina_perception_offline model.engine video.mp4 --output "
                  "./results/"
               << std::endl;
     return -1;
@@ -57,17 +93,32 @@ int main(int argc, char **argv) {
   std::string engine_path = argv[1];
   std::string input_path = argv[2];
   bool is_directory = false;
-  std::string output_dir = "";
+  std::string output_dir;
+  std::string config_path = "config.yaml";
 
-  // Parse optional arguments
   for (int i = 3; i < argc; i++) {
     std::string arg = argv[i];
     if (arg == "--dir") {
       is_directory = true;
     } else if (arg == "--output" && i + 1 < argc) {
       output_dir = argv[++i];
+    } else if (arg == "--config" && i + 1 < argc) {
+      config_path = argv[++i];
     }
   }
+
+  // ========== Load Configuration ==========
+  unina::Config config;
+  config.load(config_path);
+
+  float conf_threshold = config.get_float("conf_threshold", 0.25f);
+  float score_threshold = config.get_float("score_threshold", 0.45f);
+  bool use_nms = config.get_bool("use_nms", false);
+  float nms_iou_threshold = config.get_float("nms_iou_threshold", 0.60f);
+  int max_detections = config.get_int("max_detections", 1000);
+  int config_w = config.get_int("input_width", unina::kInputW);
+  int config_h = config.get_int("input_height", unina::kInputH);
+  auto class_names = config.get_array("class_names");
 
   // ========== Initialize Image Source ==========
   unina::FileImageSource source(input_path, is_directory);
@@ -76,17 +127,19 @@ int main(int argc, char **argv) {
     return -1;
   }
 
-  // ========== Initialize Perception ==========
-  unina::Perception3DConfig config;
-  config.engine_path = engine_path;
-  config.conf_threshold = 0.25f;
-  config.enable_3d = false; // No 3D for offline (no depth)
-
-  unina::Perception3D perception;
-  if (!perception.init(config)) {
-    std::cerr << "Failed to initialize perception pipeline" << std::endl;
+  // ========== Initialize TensorRT Runner ==========
+  unina::UninaPerception runner;
+  if (!runner.init(engine_path)) {
+    std::cerr << "Failed to initialize TensorRT engine." << std::endl;
     return -1;
   }
+
+  int input_w = runner.get_input_width() > 0 ? runner.get_input_width() : config_w;
+  int input_h = runner.get_input_height() > 0 ? runner.get_input_height() : config_h;
+
+  unina::cuda_preprocess_init(1920 * 1200 * 4);
+  unina::cuda_postprocess_init();
+  cudaStream_t stream = runner.get_stream();
 
   std::cout << "\n========================================" << std::endl;
   std::cout << "Processing " << source.total_frames() << " frames..."
@@ -99,12 +152,11 @@ int main(int argc, char **argv) {
   int total_detections = 0;
   int frame_count = 0;
 
-  // CSV output for analysis
   std::ofstream csv_out;
   if (!output_dir.empty()) {
     std::filesystem::create_directories(output_dir);
     csv_out.open(output_dir + "/detections.csv");
-    csv_out << "frame_id,class,x1,y1,x2,y2,confidence\n";
+    csv_out << "frame_id,class_id,class_name,x1,y1,x2,y2,confidence\n";
   }
 
   while (g_running && source.has_more()) {
@@ -112,92 +164,118 @@ int main(int argc, char **argv) {
       break;
     }
 
-    // Read image for visualization (FileImageSource provides CPU data)
     cv::Mat vis_image(frame.height, frame.width, CV_8UC3,
                       const_cast<uint8_t *>(frame.cpu_data));
 
-    auto result = perception.process_2d(frame);
+    auto start = std::chrono::high_resolution_clock::now();
 
-    total_latency_ms += result.latency_ms;
-    total_detections += result.cones.size();
+    void *trt_input = runner.get_input_gpu_ptr();
+    float scale = 1.0f;
+    if (runner.input_is_fp16()) {
+      scale = unina::cuda_preprocess_fp16(frame.cpu_data, frame.width, frame.height,
+                                          trt_input, input_w, input_h, false, stream);
+    } else {
+      scale = unina::cuda_preprocess(frame.cpu_data, frame.width, frame.height,
+                                     static_cast<float *>(trt_input), input_w,
+                                     input_h, false, stream);
+    }
 
-    // Draw detections
-    for (const auto &cone : result.cones) {
-      cv::Scalar color(0, 255, 0);
-      switch (cone.color) {
-      case unina::ConeColor::BIG_ORANGE:
-        color = cv::Scalar(0, 0, 255);
-        break;
-      case unina::ConeColor::BLUE:
-        color = cv::Scalar(255, 0, 0);
-        break;
-      case unina::ConeColor::SMALL_ORANGE:
-        color = cv::Scalar(0, 165, 255);
-        break;
-      case unina::ConeColor::YELLOW:
-        color = cv::Scalar(0, 255, 255);
-        break;
-      default:
-        break;
+    runner.inference();
+
+    auto output_ptrs = runner.get_output_gpu_ptrs();
+    const auto &output_layouts = runner.get_output_layouts();
+    int num_scales = runner.get_num_scales();
+    std::vector<const void *> reg_buffers(num_scales);
+    std::vector<const void *> cls_buffers(num_scales);
+    std::vector<unina::OutputTensorLayout> reg_layouts(num_scales);
+    std::vector<unina::OutputTensorLayout> cls_layouts(num_scales);
+    for (int i = 0; i < num_scales; ++i) {
+      reg_buffers[i] = output_ptrs[i];
+      cls_buffers[i] = output_ptrs[i + num_scales];
+      reg_layouts[i] = output_layouts[i];
+      cls_layouts[i] = output_layouts[i + num_scales];
+    }
+
+    auto detections = unina::cuda_decode(
+        cls_buffers.data(), reg_buffers.data(), cls_layouts.data(),
+        reg_layouts.data(), num_scales, runner.get_strides().data(), input_w,
+        input_h, conf_threshold, runner.get_num_classes(), use_nms,
+        score_threshold, nms_iou_threshold, max_detections,
+        runner.output_is_fp16(), stream);
+
+    runner.synchronize();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    double latency_ms =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count() /
+        1000.0;
+
+    int x_off = 0, y_off = 0;
+    unina::cuda_preprocess_get_offsets(x_off, y_off);
+    unina::adjust_detections_for_letterbox(detections, x_off, y_off, scale,
+                                           frame.width, frame.height);
+
+    total_latency_ms += latency_ms;
+    total_detections += static_cast<int>(detections.size());
+
+    for (const auto &det : detections) {
+      cv::Scalar color = get_palette_color(det.class_id);
+      cv::rectangle(vis_image, cv::Point(det.x1, det.y1),
+                    cv::Point(det.x2, det.y2), color, 2);
+
+      std::string class_str;
+      if (det.class_id >= 0 &&
+          det.class_id < static_cast<int>(class_names.size())) {
+        class_str = class_names[det.class_id];
+      } else {
+        class_str = "class_" + std::to_string(det.class_id);
       }
 
-      cv::rectangle(vis_image, cv::Point(cone.bbox_x1, cone.bbox_y1),
-                    cv::Point(cone.bbox_x2, cone.bbox_y2), color, 2);
-
-      std::string label = std::string(cone.color_name()) + " " +
-                          std::to_string(cone.confidence).substr(0, 4);
-      cv::putText(vis_image, label, cv::Point(cone.bbox_x1, cone.bbox_y1 - 5),
+      std::string label =
+          class_str + " " + std::to_string(det.confidence).substr(0, 4);
+      cv::putText(vis_image, label,
+                  cv::Point(det.x1, std::max(12, static_cast<int>(det.y1) - 5)),
                   cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
 
-      // CSV output
       if (csv_out.is_open()) {
-        csv_out << frame_count << "," << cone.color_name() << ","
-                << cone.bbox_x1 << "," << cone.bbox_y1 << "," << cone.bbox_x2
-                << "," << cone.bbox_y2 << "," << cone.confidence << "\n";
+        csv_out << frame_count << "," << det.class_id << "," << class_str << ","
+                << det.x1 << "," << det.y1 << "," << det.x2 << "," << det.y2
+                << "," << det.confidence << "\n";
       }
     }
 
-    // Save or display
     if (!output_dir.empty()) {
       std::string out_path =
           output_dir + "/frame_" + std::to_string(frame_count) + ".jpg";
       cv::imwrite(out_path, vis_image);
+    } else if (source.total_frames() == 1) {
+      cv::imwrite("output.jpg", vis_image);
+      std::cout << "Saved output.jpg" << std::endl;
     }
 
-    // Progress
     if (frame_count % 10 == 0 || source.total_frames() == 1) {
       std::cout << "Frame " << frame_count << "/" << source.total_frames()
-                << " | Detections: " << result.cones.size()
-                << " | Latency: " << result.latency_ms << "ms" << std::endl;
+                << " | Detections: " << detections.size()
+                << " | Latency: " << latency_ms << "ms" << std::endl;
     }
 
     frame_count++;
   }
 
-  // ========== Summary ==========
+  unina::cuda_preprocess_destroy();
+  unina::cuda_postprocess_destroy();
+
   std::cout << "\n===== Processing Complete =====" << std::endl;
   std::cout << "Frames processed: " << frame_count << std::endl;
   std::cout << "Total detections: " << total_detections << std::endl;
-  std::cout << "Avg latency: " << (total_latency_ms / frame_count) << " ms"
-            << std::endl;
-  std::cout << "Avg FPS: " << (1000.0 / (total_latency_ms / frame_count))
-            << std::endl;
-
+  if (frame_count > 0) {
+    double avg_ms = total_latency_ms / frame_count;
+    std::cout << "Avg latency: " << avg_ms << " ms" << std::endl;
+    std::cout << "Avg FPS: " << (1000.0 / avg_ms) << std::endl;
+  }
   if (!output_dir.empty()) {
     std::cout << "Results saved to: " << output_dir << std::endl;
-  }
-
-  // If single image, save output
-  if (source.total_frames() == 1 && output_dir.empty()) {
-    cv::Mat img = cv::imread(input_path);
-    auto result = perception.process_2d(frame);
-    for (const auto &cone : result.cones) {
-      cv::Scalar color(0, 255, 0);
-      cv::rectangle(img, cv::Point(cone.bbox_x1, cone.bbox_y1),
-                    cv::Point(cone.bbox_x2, cone.bbox_y2), color, 2);
-    }
-    cv::imwrite("output.jpg", img);
-    std::cout << "Saved output.jpg" << std::endl;
   }
 
   return 0;

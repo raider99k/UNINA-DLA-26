@@ -11,16 +11,10 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # CUDA Configuration for Jetson Orin (sm_87)
-# Note: For VM builds, override with: -DCMAKE_CUDA_ARCHITECTURES=native
+# Note: For non-Orin GPUs (workstation/Colab/Kaggle), override with: -DCMAKE_CUDA_ARCHITECTURES=native
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 87)
 endif()
-
-# ============================================================================
-# Build Options (Strictly Optional)
-# ============================================================================
-option(USE_ROS "Enable ROS 2 Humble integration" OFF)
-option(USE_ZED "Enable ZED SDK integration" OFF)
 
 # ============================================================================
 # Core Dependencies (Standard C++ / CUDA / TensorRT / OpenCV)
@@ -35,26 +29,6 @@ if(NOT NVINFER_LIB)
     message(FATAL_ERROR "nvinfer library not found. Please set CMAKE_LIBRARY_PATH.")
 endif()
 
-# ============================================================================
-# Optional Integration: ROS 2 Humble
-# ============================================================================
-if(USE_ROS)
-    find_package(ament_cmake REQUIRED)
-    find_package(rclcpp REQUIRED)
-    find_package(std_msgs REQUIRED)
-    find_package(geometry_msgs REQUIRED)
-    find_package(visualization_msgs REQUIRED)
-    add_compile_definitions(USE_ROS)
-endif()
-
-# ============================================================================
-# Optional Integration: ZED SDK
-# ============================================================================
-if(USE_ZED)
-    find_package(ZED 4 REQUIRED)
-    add_compile_definitions(USE_ZED_SDK)
-endif()
-
 include_directories(
     ${CUDAToolkit_INCLUDE_DIRS}
     include
@@ -64,7 +38,7 @@ if(EXISTS "/usr/include/aarch64-linux-gnu")
 endif()
 
 # ============================================================================
-# Shared Sources (Zero ROS / Zero ZED dependencies)
+# Shared Sources
 # ============================================================================
 set(CUDA_SOURCES
     src/CudaPreprocess.cu
@@ -72,28 +46,31 @@ set(CUDA_SOURCES
 )
 set(CORE_SOURCES
     src/UninaPerception.cpp
-    src/Perception3D.cpp
     src/FileImageSource.cpp
 )
 
+set(TRT_LIBS ${NVINFER_LIB})
+if(NVPARSERS_LIB)
+    list(APPEND TRT_LIBS ${NVPARSERS_LIB})
+endif()
+
 # ============================================================================
-# Target 1: unina_perception (Standalone image-file mode)
+# Target 1: unina_perception (Standalone single-image inference)
 # ============================================================================
-add_executable(unina_perception 
-    main.cpp 
+add_executable(unina_perception
+    main.cpp
     ${CORE_SOURCES}
     ${CUDA_SOURCES}
 )
 target_link_libraries(unina_perception
     ${OpenCV_LIBS}
     CUDA::cudart
-    ${NVINFER_LIB}
-    ${NVPARSERS_LIB}
+    ${TRT_LIBS}
 )
 add_executable(unina_perception_standalone ALIAS unina_perception)
 
 # ============================================================================
-# Target 2: unina_perception_offline (Standalone batch directory/video testing)
+# Target 2: unina_perception_offline (Batch directory / video testing)
 # ============================================================================
 add_executable(unina_perception_offline
     main_offline.cpp
@@ -103,93 +80,15 @@ add_executable(unina_perception_offline
 target_link_libraries(unina_perception_offline
     ${OpenCV_LIBS}
     CUDA::cudart
-    ${NVINFER_LIB}
-    ${NVPARSERS_LIB}
+    ${TRT_LIBS}
 )
-
-# ============================================================================
-# Target 3: unina_perception_zed (Live ZED X camera with 3D, no ROS)
-# ============================================================================
-if(USE_ZED)
-    add_executable(unina_perception_zed 
-        main_zed.cpp 
-        ${CORE_SOURCES}
-        src/ZedImageSource.cpp
-        ${CUDA_SOURCES}
-    )
-    target_link_libraries(unina_perception_zed
-        ${OpenCV_LIBS}
-        CUDA::cudart
-        ${NVINFER_LIB}
-        ${NVPARSERS_LIB}
-        ${ZED_LIBRARIES}
-    )
-    target_include_directories(unina_perception_zed PRIVATE ${ZED_INCLUDE_DIRS})
-endif()
-
-# ============================================================================
-# Target 4: unina_perception_ros (ROS 2 Humble Node)
-# ============================================================================
-if(USE_ROS AND USE_ZED)
-    add_executable(unina_perception_ros
-        main_ros.cpp
-        ${CORE_SOURCES}
-        src/ZedImageSource.cpp
-        ${CUDA_SOURCES}
-    )
-    
-    ament_target_dependencies(unina_perception_ros
-        rclcpp
-        std_msgs
-        geometry_msgs
-        visualization_msgs
-    )
-    
-    target_link_libraries(unina_perception_ros
-        ${OpenCV_LIBS}
-        CUDA::cudart
-        ${NVINFER_LIB}
-        ${NVPARSERS_LIB}
-        ${ZED_LIBRARIES}
-    )
-    
-    target_include_directories(unina_perception_ros PRIVATE ${ZED_INCLUDE_DIRS})
-endif()
 
 # ============================================================================
 # Installation Rules
 # ============================================================================
-if(USE_ROS)
-    install(TARGETS unina_perception unina_perception_offline
-        DESTINATION lib/${PROJECT_NAME}
-    )
-    if(USE_ZED)
-        install(TARGETS unina_perception_zed
-            DESTINATION lib/${PROJECT_NAME}
-        )
-        if(TARGET unina_perception_ros)
-            install(TARGETS unina_perception_ros
-                DESTINATION lib/${PROJECT_NAME}
-            )
-        endif()
-    endif()
-
-    install(FILES config.yaml
-        DESTINATION share/${PROJECT_NAME}
-    )
-    ament_package()
-else()
-    install(TARGETS unina_perception unina_perception_offline
-        RUNTIME DESTINATION bin
-    )
-    if(USE_ZED)
-        install(TARGETS unina_perception_zed
-            RUNTIME DESTINATION bin
-        )
-    endif()
-
-    install(FILES config.yaml
-        DESTINATION share/${PROJECT_NAME}
-    )
-endif()
-
+install(TARGETS unina_perception unina_perception_offline
+    RUNTIME DESTINATION bin
+)
+install(FILES config.yaml
+    DESTINATION share/${PROJECT_NAME}
+)

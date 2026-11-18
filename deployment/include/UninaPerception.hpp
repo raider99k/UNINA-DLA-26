@@ -43,6 +43,8 @@ public:
   bool is_dla_active() const { return dla_active_; }
   int get_num_classes() const { return num_classes_; }
   int get_num_scales() const { return num_scales_; }
+  int get_input_width() const { return input_w_; }
+  int get_input_height() const { return input_h_; }
   const std::vector<int> &get_strides() const { return strides_; }
 
   // Get the internal CUDA stream for unified pipeline operations
@@ -86,6 +88,7 @@ private:
   bool output_is_fp16_ = false;
   bool dla_active_ = false;
   int num_classes_ = 4; // Default safe fallback
+  int input_w_ = 640;   // Dynamic input width tracking
   int input_h_ = 640;   // Dynamic input height tracking
 };
 

@@ -34,7 +34,10 @@ unina_dla_teacher_backup/
 *.onnx.data
 *.engine
 *.plan
+*.calib
 calib.cache
+*_int8_scales.json
+*_manifest.json
 layer_info.json
 dla_log.txt
 *.log

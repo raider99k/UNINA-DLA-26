@@ -32,24 +32,23 @@ void setup_signal_handlers() {
 // ============================================================================
 
 cv::Scalar get_palette_color(int class_id) {
-  // Canonical palette for FS Driverless classes 0..3 + distinct palette for generic classes
   static const std::vector<cv::Scalar> palette = {
-      cv::Scalar(0, 255, 255),   // Class 0: Yellow (BGR)
-      cv::Scalar(255, 0, 0),     // Class 1: Blue
-      cv::Scalar(0, 140, 255),   // Class 2: SmallOrange
-      cv::Scalar(0, 69, 255),    // Class 3: LargeOrange
-      cv::Scalar(0, 255, 0),     // Class 4: Green
-      cv::Scalar(255, 0, 255),   // Class 5: Magenta
-      cv::Scalar(255, 255, 0),   // Class 6: Cyan
-      cv::Scalar(180, 105, 255), // Class 7: Hot Pink
-      cv::Scalar(255, 191, 0),   // Class 8: Deep Sky Blue
-      cv::Scalar(50, 205, 50),   // Class 9: Lime Green
-      cv::Scalar(203, 192, 255), // Class 10: Light Pink
-      cv::Scalar(0, 215, 255),   // Class 11: Gold
-      cv::Scalar(238, 130, 238), // Class 12: Violet
-      cv::Scalar(75, 0, 130),    // Class 13: Indigo
-      cv::Scalar(128, 128, 0),   // Class 14: Teal
-      cv::Scalar(0, 128, 128),   // Class 15: Olive
+      cv::Scalar(0, 255, 255),   // Class 0
+      cv::Scalar(255, 0, 0),     // Class 1
+      cv::Scalar(0, 140, 255),   // Class 2
+      cv::Scalar(0, 69, 255),    // Class 3
+      cv::Scalar(0, 255, 0),     // Class 4
+      cv::Scalar(255, 0, 255),   // Class 5
+      cv::Scalar(255, 255, 0),   // Class 6
+      cv::Scalar(180, 105, 255), // Class 7
+      cv::Scalar(255, 191, 0),   // Class 8
+      cv::Scalar(50, 205, 50),   // Class 9
+      cv::Scalar(203, 192, 255), // Class 10
+      cv::Scalar(0, 215, 255),   // Class 11
+      cv::Scalar(238, 130, 238), // Class 12
+      cv::Scalar(75, 0, 130),    // Class 13
+      cv::Scalar(128, 128, 0),   // Class 14
+      cv::Scalar(0, 128, 128),   // Class 15
   };
   if (class_id >= 0 && class_id < static_cast<int>(palette.size())) {
     return palette[class_id];
@@ -113,6 +112,13 @@ int main(int argc, char **argv) {
     return -1;
   }
 
+  int input_w = runner.get_input_width() > 0
+                    ? runner.get_input_width()
+                    : config.get_int("input_width", unina::kInputW);
+  int input_h = runner.get_input_height() > 0
+                    ? runner.get_input_height()
+                    : config.get_int("input_height", unina::kInputH);
+
   // ========== 2. Initialize CUDA Resources ==========
   unina::cuda_preprocess_init(4096 * 4096 * 3);
   unina::cuda_postprocess_init();
@@ -137,13 +143,12 @@ int main(int argc, char **argv) {
   if (runner.input_is_fp16()) {
     // FP16 input for DLA
     scale = unina::cuda_preprocess_fp16(img.data, img.cols, img.rows, trt_input,
-                                        unina::kInputW, unina::kInputH, false,
-                                        stream);
+                                        input_w, input_h, false, stream);
   } else {
     // FP32 input
     scale = unina::cuda_preprocess(
         img.data, img.cols, img.rows, static_cast<float *>(trt_input),
-        unina::kInputW, unina::kInputH, false, stream);
+        input_w, input_h, false, stream);
   }
 
   // ========== 5. Inference (DLA) ==========
@@ -154,20 +159,26 @@ int main(int argc, char **argv) {
 
   // ========== 6. Postprocess (CUDA) ==========
   auto output_ptrs = runner.get_output_gpu_ptrs();
+  const auto &output_layouts = runner.get_output_layouts();
   int num_scales = runner.get_num_scales();
   std::vector<const void *> reg_buffers(num_scales);
   std::vector<const void *> cls_buffers(num_scales);
+  std::vector<unina::OutputTensorLayout> reg_layouts(num_scales);
+  std::vector<unina::OutputTensorLayout> cls_layouts(num_scales);
   for (int i = 0; i < num_scales; ++i) {
     reg_buffers[i] = output_ptrs[i];
     cls_buffers[i] = output_ptrs[i + num_scales];
+    reg_layouts[i] = output_layouts[i];
+    cls_layouts[i] = output_layouts[i + num_scales];
   }
 
   auto detections =
-      unina::cuda_decode(cls_buffers.data(), reg_buffers.data(), num_scales,
-                         runner.get_strides().data(), unina::kInputW,
-                         unina::kInputH, conf_threshold, runner.get_num_classes(),
-                         use_nms, score_threshold, nms_iou_threshold,
-                         max_detections, runner.output_is_fp16(), stream);
+      unina::cuda_decode(cls_buffers.data(), reg_buffers.data(),
+                         cls_layouts.data(), reg_layouts.data(), num_scales,
+                         runner.get_strides().data(), input_w, input_h,
+                         conf_threshold, runner.get_num_classes(), use_nms,
+                         score_threshold, nms_iou_threshold, max_detections,
+                         runner.output_is_fp16(), stream);
 
   runner.synchronize();
 
@@ -203,7 +214,7 @@ int main(int argc, char **argv) {
     }
     std::string label = class_str + " " +
                         std::to_string(det.confidence).substr(0, 4);
-    cv::putText(img, label, cv::Point(det.x1, std::max(12, det.y1 - 5)),
+    cv::putText(img, label, cv::Point(det.x1, std::max(12, static_cast<int>(det.y1) - 5)),
                 cv::FONT_HERSHEY_SIMPLEX, 0.5, color, 1);
   }
 

@@ -184,9 +184,14 @@ bool UninaPerception::init(const std::string &engine_path) {
   for (int i = 0; i < dims.nbDims; ++i)
     vol *= std::max(1, dims.d[i]);
 
-  // Capture input height for dynamic stride calculation
-  if (dims.nbDims >= 3) {
+  // Capture input dimensions for dynamic preprocessing & stride calculation
+  if (dims.nbDims >= 4) {
     // dims: [Batch, Channels, H, W]
+    input_h_ = dims.d[2];
+    input_w_ = dims.d[3];
+    std::cout << "[TRT] Auto-detected Input Size: " << input_w_ << "x"
+              << input_h_ << std::endl;
+  } else if (dims.nbDims >= 3) {
     input_h_ = dims.d[2];
     std::cout << "[TRT] Auto-detected Input Height: " << input_h_ << std::endl;
   }
